@@ -1,0 +1,13 @@
+/state/
+/tls/
+/acme/
+/export/
+/backups/
+/bin/
+*.tar.gz
+*.pem
+*.env
+integration.json
+main-server.json
+deploy.json
+__pycache__/

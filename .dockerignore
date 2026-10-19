@@ -1,0 +1,14 @@
+.git
+.gitignore
+state
+tls
+acme
+export
+backups
+*.tar.gz
+*.pem
+*.env
+integration.json
+main-server.json
+deploy.json
+__pycache__
