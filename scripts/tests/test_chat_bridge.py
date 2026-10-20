@@ -39,7 +39,9 @@ class ChatBridgeTests(unittest.TestCase):
         self.home.mkdir(mode=0o700)
         self.release = self.root / 'releases/v2.1.0'
         (self.release / 'scripts').mkdir(parents=True)
-        shutil.copyfile(Path(__file__).parents[3] / 'server/scripts/familychat.py', self.release / 'scripts/familychat.py')
+        # Pin the real main-server controller so this separate repository's tests
+        # also work in CI and standalone clones without a sibling server checkout.
+        shutil.copyfile(Path(__file__).parent / 'fixtures/familychat_controller.py', self.release / 'scripts/familychat.py')
         (self.release / 'release.json').write_text('{"external_key_service":1}')
         (self.release / 'compose.keyserver.yaml').touch()
         (self.root / 'current').symlink_to(self.release)
