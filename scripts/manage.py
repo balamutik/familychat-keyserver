@@ -545,12 +545,12 @@ def main():
     setup.add_argument("--port", type=int, default=8443)
     setup.add_argument("--acme-binary", default="/root/.acme.sh/acme.sh")
     setup.add_argument("--source", default=str(SOURCE))
-    update = commands.add_parser("update")
-    update.add_argument("--source", default=str(SOURCE))
+    update_parser = commands.add_parser("update")
+    update_parser.add_argument("--source", default=str(SOURCE))
     commands.add_parser("renew")
     archive = commands.add_parser("backup")
     archive.add_argument("--output")
-    for sub in (setup, update, commands.choices["renew"], archive):
+    for sub in (setup, update_parser, commands.choices["renew"], archive):
         sub.add_argument("--install-dir", default=DEFAULT_INSTALL)
     args = parser.parse_args()
     validate_install_dir(args.install_dir)

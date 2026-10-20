@@ -116,6 +116,29 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(manage.load_config(root)['image'], IMAGE)
             self.assertEqual((root / 'state/state.json').read_bytes(), original)
 
+    def test_cli_update_dispatch_reaches_backup_and_preserves_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'state').mkdir(mode=0o700)
+            original = b'{"private_key":"preserve","ticket_secret":"preserve-too"}'
+            (root / 'state/state.json').write_bytes(original)
+            (root / 'state/state.json').chmod(0o600)
+            config = dict(install_dir=str(root), domain='keys.example.com', email='admin@example.com',
+                          port=8443, client='certbot', challenge='standalone')
+            manage.private_json(root / 'deploy.json', config)
+            (root / 'service.env').write_text('KEYSERVER_BUILD_CONTEXT=./app\nKEYSERVER_DOMAIN=keys.example.com\nKEYSERVER_PORT=8443\n')
+            calls = []
+            with mock.patch.object(manage.sys, 'argv', ['manage.py', 'update', '--source', str(ROOT), '--install-dir', str(root)]), \
+                    mock.patch.object(manage.os, 'geteuid', return_value=0), \
+                    mock.patch.object(manage, 'ensure_docker'), mock.patch.object(manage, 'install_timer'), \
+                    mock.patch.object(manage, 'command', side_effect=lambda args, **kw: calls.append(list(map(str, args)))):
+                manage.main()
+            self.assertTrue(list((root / 'backups').glob('*.tar.gz')))
+            self.assertTrue(any('build' in call for call in calls))
+            self.assertTrue(any('up' in call for call in calls))
+            self.assertFalse(any('init' in call for call in calls))
+            self.assertEqual((root / 'state/state.json').read_bytes(), original)
+
     def test_release_install_initializes_using_exact_service_image(self):
         with tempfile.TemporaryDirectory() as directory:
             root, payload = Path(directory) / 'installed', Path(directory) / 'release'
