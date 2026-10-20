@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -145,9 +146,11 @@ def ensure_acme(config):
     if config['client'] == 'certbot':
         if not shutil.which('certbot'):
             install_packages(['certbot'])
+        require_ip_support(config)
         return
     binary = Path(config['acme_binary'])
     if binary.is_file():
+        require_ip_support(config)
         return
     if not binary.is_absolute() or binary.name != 'acme.sh':
         raise ValueError('--acme-binary должен быть абсолютным путём к acme.sh')
@@ -180,6 +183,35 @@ def ensure_acme(config):
         command(['sh', root / prefix / 'acme.sh', '--install', '--home', binary.parent, '--nocron', '--noprofile', '--accountemail', config['email']], cwd=root / prefix)
     if not binary.is_file():
         raise RuntimeError('acme.sh не установлен')
+    require_ip_support(config)
+
+
+def ip_address(host):
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def require_ip_support(config):
+    if ip_address(config['domain']) is None:
+        return
+    if config['client'] == 'certbot':
+        args, flags = ['certbot', '--help', 'all'], ('--ip-address', '--required-profile')
+        message = 'Для IP-сертификата обновите certbot (поддержка IP в 5.4+) либо выберите --client acme.sh'
+    else:
+        args, flags = [config['acme_binary'], '--help'], ('--certificate-profile', '--days')
+        message = 'Для IP-сертификата обновите acme.sh: требуется поддержка --certificate-profile и --days'
+    result = subprocess.run(args, check=True, capture_output=True, text=True)
+    if not all(flag in result.stdout for flag in flags):
+        raise RuntimeError(message)
+
+
+def server_url(config):
+    host = config['domain']
+    if ':' in host:
+        host = '[' + host + ']'
+    return f"https://{host}:{config['port']}"
 
 
 def release_manifest(source):
@@ -241,10 +273,18 @@ def read_dns_env(path):
 
 def validate(config):
     domain = config["domain"]
-    if not isinstance(domain, str) or len(domain) > 253 or not re.fullmatch(
+    if not isinstance(domain, str):
+        raise ValueError("Укажите DNS-имя или публичный IP-адрес")
+    address = ip_address(domain)
+    if address is not None:
+        if not address.is_global or address.is_multicast or '%' in domain:
+            raise ValueError("Для сертификата нужен публичный IP-адрес сервера")
+        if config['challenge'] == 'dns':
+            raise ValueError("DNS-01 не подтверждает IP-адрес. Выберите standalone или webroot с доступным портом 80")
+    elif re.fullmatch(r'[0-9.]+', domain) or len(domain) > 253 or not re.fullmatch(
         r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", domain
     ) or "." not in domain or any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-") for label in domain.split(".")):
-        raise ValueError("Укажите DNS-имя без https://, порта и пути, например keys.example.com")
+        raise ValueError("Укажите DNS-имя или публичный IP без https://, порта и пути, например keys.example.com")
     if not isinstance(config["port"], int) or not 1024 <= config["port"] <= 65535 or config["port"] == 8080:
         raise ValueError("Порт сервера ключей должен быть отдельным: 1024–65535, кроме 8080. По умолчанию 8443; 80/443 не используются приложением")
     if config["client"] not in ("certbot", "acme.sh") or config["challenge"] not in ("standalone", "webroot", "dns"):
@@ -303,7 +343,11 @@ def dns_args(config):
 
 def issue_command(config):
     if config["client"] == "certbot":
-        args = certbot_base(config) + ["certonly", "--non-interactive", "--agree-tos", "--email", config["email"], "--cert-name", "familychat-keyserver", "--keep-until-expiring", "-d", config["domain"]]
+        args = certbot_base(config) + ["certonly", "--non-interactive", "--agree-tos", "--email", config["email"], "--cert-name", "familychat-keyserver", "--keep-until-expiring"]
+        if ip_address(config['domain']) is not None:
+            args += ['--required-profile', 'shortlived', '--ip-address', config['domain']]
+        else:
+            args += ['-d', config['domain']]
         if config["challenge"] == "standalone":
             args += ["--standalone", "--preferred-challenges", "http"]
         elif config["challenge"] == "webroot":
@@ -312,6 +356,8 @@ def issue_command(config):
             args += dns_args(config)
         return args
     args = acme_base(config) + ["--issue", "--server", "letsencrypt", "--keylength", "ec-256", "-d", config["domain"]]
+    if ip_address(config['domain']) is not None:
+        args += ['--certificate-profile', 'shortlived', '--days', '3']
     if config["challenge"] == "standalone":
         args += ["--standalone"]
     elif config["challenge"] == "webroot":
@@ -359,6 +405,11 @@ def publish_certificate(config):
 
 
 def certificate(config, renew=False):
+    acme_dir = Path(config['install_dir']) / 'acme'
+    protect_tree(acme_dir)
+    if config['client'] == 'acme.sh':
+        # acme.sh touches http.header before creating its configuration home.
+        protect_tree(acme_dir / 'acme.sh')
     env = os.environ.copy()
     if config.get("dns_env"):
         env.update(read_dns_env(config["dns_env"]))
@@ -366,11 +417,15 @@ def certificate(config, renew=False):
         ensure_port_available(80)
     if config["client"] == "certbot":
         args = certbot_base(config) + ["renew", "--non-interactive", "--cert-name", "familychat-keyserver"] if renew else issue_command(config)
+        if renew and ip_address(config['domain']) is not None:
+            args += ['--required-profile', 'shortlived']
         command(args, env=env)
     else:
         if not renew:
             command(acme_base(config) + ["--register-account", "--server", "letsencrypt", "-m", config["email"]], env=env)
         args = acme_base(config) + ["--renew", "--server", "letsencrypt", "--ecc", "-d", config["domain"]] if renew else issue_command(config)
+        if renew and ip_address(config['domain']) is not None:
+            args += ['--certificate-profile', 'shortlived', '--days', '3']
         # acme.sh uses exit 2 when renewal is not due; this is not an error.
         result = subprocess.run([str(arg) for arg in args], env=env)
         if result.returncode not in (0, 2):
@@ -449,7 +504,7 @@ def deployment_lock(root):
 
 def install(args):
     config = vars(args).copy()
-    for name, question, default in (("domain", "Домен сервера ключей", None), ("email", "Email для сертификата", None), ("client", "Клиент сертификатов: certbot или acme.sh", "certbot"), ("challenge", "Проверка домена: standalone, webroot или dns", "standalone")):
+    for name, question, default in (("domain", "Домен или публичный IP сервера ключей", None), ("email", "Email для сертификата", None), ("client", "Клиент сертификатов: certbot или acme.sh", "certbot"), ("challenge", "Проверка адреса: standalone, webroot или dns", "standalone")):
         if not config.get(name):
             config[name] = prompt(question + (f" [{default}]" if default else "") + ":") or default
     validate(config)
@@ -486,7 +541,9 @@ def install(args):
         private_json(root / "certbot-dns-args.json", arguments)
         config["certbot_dns_args"] = str(root / "certbot-dns-args.json")
     copy_source(args.source, root)
-    env = f"KEYSERVER_BUILD_CONTEXT=./app\nKEYSERVER_STATE_DIR=./state\nKEYSERVER_TLS_DIR=./tls\nKEYSERVER_PORT={config['port']}\nKEYSERVER_DOMAIN={config['domain']}\n"
+    # Compose uses this value inside the HTTPS health-check URL.
+    uri_host = f"[{config['domain']}]" if ':' in config['domain'] else config['domain']
+    env = f"KEYSERVER_BUILD_CONTEXT=./app\nKEYSERVER_STATE_DIR=./state\nKEYSERVER_TLS_DIR=./tls\nKEYSERVER_PORT={config['port']}\nKEYSERVER_DOMAIN={uri_host}\n"
     (root / "service.env").write_text(env)
     (root / "service.env").chmod(0o600)
     image = prepare_image(root, manifest)
@@ -500,14 +557,14 @@ def install(args):
             target = "/import/" + name
             initialize += ["--mount", f"type=bind,src={source},dst={target},readonly"]
             imports += [flag, target]
-    initialize += [image, "init", "--state-dir", "/state", "--url", f"https://{config['domain']}:{config['port']}/api/v1/keys/current", "--export", "/export/main-server.json", *imports]
+    initialize += [image, "init", "--state-dir", "/state", "--url", server_url(config) + "/api/v1/keys/current", "--export", "/export/main-server.json", *imports]
     command(initialize)
     protect_tree(root / "state", 10001)
     certificate(config)
     private_json(root / "deploy.json", {key: value for key, value in config.items() if key not in ("import_json", "import_public", "import_private", "handler", "command")})
     compose(root, "up", "-d", "--wait", "--wait-timeout", "60")
     install_timer(root)
-    print(f"Сервер ключей: https://{config['domain']}:{config['port']}\nДля основного сервера скопируйте только {root}/export/main-server.json\nСохраните резервную копию через backup.sh")
+    print(f"Сервер ключей: {server_url(config)}\nДля основного сервера скопируйте только {root}/export/main-server.json\nСохраните резервную копию через backup.sh")
 
 
 def load_config(root):

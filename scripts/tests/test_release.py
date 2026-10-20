@@ -140,6 +140,11 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual((root / 'state/state.json').read_bytes(), original)
 
     def test_release_install_initializes_using_exact_service_image(self):
+        for address in ('keys.example.com', '2606:4700:4700::1111'):
+            with self.subTest(address=address):
+                self.check_release_install(address)
+
+    def check_release_install(self, address):
         with tempfile.TemporaryDirectory() as directory:
             root, payload = Path(directory) / 'installed', Path(directory) / 'release'
             root.mkdir()
@@ -147,7 +152,7 @@ class ReleaseTests(unittest.TestCase):
             self.package(payload)
             with tarfile.open(payload / 'familychat-keyserver.tar.gz') as archive:
                 archive.extractall(payload / 'extracted', filter='data')
-            args = argparse.Namespace(install_dir=str(root), source=str(payload / 'extracted'), domain='keys.example.com',
+            args = argparse.Namespace(install_dir=str(root), source=str(payload / 'extracted'), domain=address,
                                       email='admin@example.com', port=8443, client='certbot', challenge='standalone',
                                       acme_binary='/root/.acme.sh/acme.sh', import_json=None, import_public=None, import_private=None)
             calls = []
@@ -161,6 +166,9 @@ class ReleaseTests(unittest.TestCase):
             self.assertFalse(any('build' in call for call in calls))
             self.assertTrue(any('pull' in call for call in calls))
             self.assertIn(IMAGE, (root / 'compose.yaml').read_text())
+            if ':' in address:
+                self.assertIn(f'KEYSERVER_DOMAIN=[{address}]\n', (root / 'service.env').read_text())
+                self.assertEqual(init[init.index('--url') + 1], f'https://[{address}]:8443/api/v1/keys/current')
 
     def test_release_manifest_cannot_redirect_image_or_repository(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -172,6 +180,38 @@ class ReleaseTests(unittest.TestCase):
             (root / 'compose.yaml').write_text('services:\n  keyserver:\n    image: evil:latest\n')
             with self.assertRaises(ValueError):
                 manage.release_manifest(root)
+
+    def test_retry_after_certificate_failure_preserves_existing_keys_and_ticket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'installed'
+            (root / 'state').mkdir(parents=True, mode=0o700)
+            (root / 'export').mkdir(mode=0o700)
+            original = b'{"private_key":"existing-key","ticket_secret":"existing-ticket-secret"}\n'
+            exported = b'{"url":"https://213.155.29.175:8443/api/v1/keys/current","ticket_secret":"existing-ticket-secret"}\n'
+            (root / 'state/state.json').write_bytes(original)
+            (root / 'export/main-server.json').write_bytes(exported)
+            args = argparse.Namespace(install_dir=str(root), source=str(ROOT), domain='213.155.29.175',
+                                      email='admin@example.com', port=8443, client='acme.sh', challenge='standalone',
+                                      acme_binary='/root/.acme.sh/acme.sh', import_json=None, import_public=None, import_private=None)
+            calls = []
+            with mock.patch.object(manage, 'command', side_effect=lambda args, **kw: calls.append(list(map(str, args)))), \
+                    mock.patch.object(manage, 'ensure_docker'), mock.patch.object(manage, 'ensure_acme'), \
+                    mock.patch.object(manage, 'ensure_port_available'), mock.patch.object(manage, 'install_timer'), \
+                    mock.patch.object(manage.os, 'chown'), \
+                    mock.patch.object(manage, 'certificate', side_effect=[RuntimeError('ACME rejected identifier'), None]):
+                with self.assertRaisesRegex(RuntimeError, 'ACME rejected'):
+                    manage.install(args)
+                self.assertFalse((root / 'deploy.json').exists())
+                self.assertFalse(any('up' in call for call in calls))
+                self.assertEqual((root / 'state/state.json').read_bytes(), original)
+                self.assertEqual((root / 'export/main-server.json').read_bytes(), exported)
+                manage.install(args)
+            self.assertEqual((root / 'state/state.json').read_bytes(), original)
+            self.assertEqual((root / 'export/main-server.json').read_bytes(), exported)
+            self.assertEqual(manage.load_config(root)['domain'], '213.155.29.175')
+            self.assertTrue(any('up' in call for call in calls))
+            init = next(call for call in calls if 'init' in call)
+            self.assertEqual(init[init.index('--url') + 1], 'https://213.155.29.175:8443/api/v1/keys/current')
 
     def test_dependency_install_requires_confirmation_before_any_command(self):
         with mock.patch.object(manage, 'prompt', return_value='n'), mock.patch.object(manage, 'command') as execute:

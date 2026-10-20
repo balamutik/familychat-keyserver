@@ -8,6 +8,7 @@ import stat
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("keyserver_manage", Path(__file__).parents[1] / "manage.py")
 manage = importlib.util.module_from_spec(SPEC)
@@ -16,9 +17,102 @@ SPEC.loader.exec_module(manage)
 
 class DeployTests(unittest.TestCase):
     def config(self, root, **kwargs):
-        return dict(install_dir=str(root), domain="keys.example.com", email="family@example.com", port=8443,
+        config = dict(install_dir=str(root), domain="keys.example.com", email="family@example.com", port=8443,
                     client="certbot", challenge="standalone", webroot=None, dns_provider=None,
-                    dns_env=None, certbot_dns_args=None, acme_binary="/root/.acme.sh/acme.sh", **kwargs)
+                    dns_env=None, certbot_dns_args=None, acme_binary="/root/.acme.sh/acme.sh")
+        return config | kwargs
+
+    def test_public_ip_certificates_require_shortlived_profile_for_both_clients(self):
+        with tempfile.TemporaryDirectory() as root:
+            for address in ("213.155.29.175", "2606:4700:4700::1111"):
+                for client in ("certbot", "acme.sh"):
+                    with self.subTest(address=address, client=client):
+                        config = self.config(root, domain=address, client=client)
+                        manage.validate(config)
+                        args = manage.issue_command(config)
+                        self.assertIn("shortlived", args)
+                        if client == "certbot":
+                            self.assertIn("--required-profile", args)
+                            self.assertEqual(args[args.index("--ip-address") + 1], address)
+                            self.assertNotIn("-d", args)
+                        else:
+                            self.assertIn("--certificate-profile", args)
+                            self.assertEqual(args[args.index("--days") + 1], "3")
+
+    def test_ip_certificate_rejects_nonpublic_addresses_and_dns_challenge(self):
+        with tempfile.TemporaryDirectory() as root:
+            for address in ("127.0.0.1", "10.0.0.1", "192.168.1.1", "100.64.0.1", "0.0.0.0",
+                            "224.0.0.1", "999.1.1.1", "213.155.29.0175", "::1", "fc00::1", "fe80::1%eth0"):
+                with self.subTest(address=address), self.assertRaises(ValueError):
+                    manage.validate(self.config(root, domain=address))
+            with self.assertRaisesRegex(ValueError, "DNS-01"):
+                manage.validate(self.config(root, domain="213.155.29.175", client="acme.sh",
+                                            challenge="dns", dns_provider="dns_cf"))
+
+    def test_dns_names_keep_normal_certificate_profile(self):
+        with tempfile.TemporaryDirectory() as root:
+            for client in ("certbot", "acme.sh"):
+                args = manage.issue_command(self.config(root, client=client))
+                self.assertNotIn("shortlived", args)
+                self.assertNotIn("--days", args)
+                self.assertNotIn("--ip-address", args)
+                self.assertEqual(args[args.index("-d") + 1], "keys.example.com")
+
+    def test_acme_config_home_exists_and_is_private_before_registration_and_renewal(self):
+        for renew in (False, True):
+            with self.subTest(renew=renew), tempfile.TemporaryDirectory() as root:
+                binary = Path(root) / "acme.sh"
+                binary.write_text('#!/bin/sh\n[ "$1" = "--config-home" ] || exit 98\n'
+                                  '[ -d "$2" ] || exit 99\ntouch "$2/http.header"\n')
+                binary.chmod(0o700)
+                config = self.config(root, client="acme.sh", acme_binary=str(binary))
+                with mock.patch.object(manage, "ensure_port_available"), mock.patch.object(manage, "publish_certificate"):
+                    try:
+                        manage.certificate(config, renew=renew)
+                    except Exception as error:
+                        self.fail(f"ACME client ran before its config directory existed: {error}")
+                home = Path(root) / "acme/acme.sh"
+                self.assertTrue((home / "http.header").is_file())
+                self.assertEqual(stat.S_IMODE(home.stat().st_mode), 0o700)
+
+    def test_ip_renewal_keeps_profile_and_short_schedule(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = self.config(root, client="acme.sh", domain="213.155.29.175")
+            with mock.patch.object(manage, "ensure_port_available"), mock.patch.object(manage, "publish_certificate"), \
+                    mock.patch.object(manage.subprocess, "run", return_value=mock.Mock(returncode=2)) as execute:
+                manage.certificate(config, renew=True)
+            args = execute.call_args.args[0]
+            self.assertIn("--renew", args)
+            self.assertIn("--certificate-profile", args)
+            self.assertIn("shortlived", args)
+            self.assertEqual(args[args.index("--days") + 1], "3")
+
+    def test_old_acme_clients_fail_early_for_ip_certificate(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = Path(root) / "acme.sh"
+            binary.touch()
+            for client in ("certbot", "acme.sh"):
+                config = self.config(root, domain="213.155.29.175", client=client, acme_binary=str(binary))
+                with self.subTest(client=client), mock.patch.object(manage.shutil, "which", return_value="/bin/certbot"), \
+                        mock.patch.object(manage.subprocess, "run", return_value=mock.Mock(stdout="old client", returncode=0)):
+                    with self.assertRaisesRegex(RuntimeError, "IP"):
+                        manage.ensure_acme(config)
+
+    def test_capable_acme_clients_can_issue_ip_certificates(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = Path(root) / "acme.sh"
+            binary.touch()
+            for client, help_text in (("certbot", "--ip-address --required-profile"),
+                                      ("acme.sh", "--certificate-profile --days")):
+                config = self.config(root, domain="213.155.29.175", client=client, acme_binary=str(binary))
+                with self.subTest(client=client), mock.patch.object(manage.shutil, "which", return_value="/bin/certbot"), \
+                        mock.patch.object(manage.subprocess, "run", return_value=mock.Mock(stdout=help_text, returncode=0)):
+                    manage.ensure_acme(config)
+
+    def test_server_url_brackets_ipv6_without_changing_certificate_identifier(self):
+        config = self.config("/opt/familychat-keyserver", domain="2606:4700:4700::1111")
+        self.assertEqual(manage.server_url(config), "https://[2606:4700:4700::1111]:8443")
+        self.assertEqual(config["domain"], "2606:4700:4700::1111")
 
     def test_rejects_main_server_ports_and_unsafe_hostnames(self):
         with tempfile.TemporaryDirectory() as root:
