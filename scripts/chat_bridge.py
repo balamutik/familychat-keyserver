@@ -55,25 +55,30 @@ def _directory(path):
 
 
 def _read(path, limit=16384, modes=None, owner=None):
-    with _directory(path.parent) as parent:
-        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-        try:
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_size > limit
-                    or modes is not None and stat.S_IMODE(info.st_mode) not in modes
-                    or owner is not None and info.st_uid != owner):
-                raise LinkError('Небезопасный файл настроек или неверные права доступа.')
-            data = b''
-            while len(data) <= limit:
-                chunk = os.read(fd, min(65536, limit + 1 - len(data)))
-                if not chunk:
-                    break
-                data += chunk
-            if len(data) > limit:
-                raise LinkError('Слишком большой файл настроек.')
-            return data, info
-        finally:
-            os.close(fd)
+    try:
+        with _directory(path.parent) as parent:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_size > limit
+                        or modes is not None and stat.S_IMODE(info.st_mode) not in modes
+                        or owner is not None and info.st_uid != owner):
+                    raise LinkError('Небезопасный файл настроек или неверные права доступа.')
+                data = b''
+                while len(data) <= limit:
+                    chunk = os.read(fd, min(65536, limit + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data += chunk
+                if len(data) > limit:
+                    raise LinkError('Слишком большой файл настроек.')
+                return data, info
+            finally:
+                os.close(fd)
+    except OSError as error:
+        # openat() reports only the basename; retain the path for safe diagnostics.
+        error.filename = str(path)
+        raise
 
 
 def _write(path, data, mode=0o600, uid=ROOT_UID, gid=0):
@@ -118,7 +123,8 @@ def _private_directory(path, uid, gid, create=False):
     with _directory(path) as fd:
         info = os.fstat(fd)
         if info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700:
-            raise LinkError('Служебный каталог должен принадлежать нужному пользователю и иметь права 700.')
+            raise LinkError(f'Каталог {path} должен принадлежать UID {uid} и иметь права 0700; '
+                            f'сейчас UID {info.st_uid}, права {stat.S_IMODE(info.st_mode):04o}.')
 
 
 @contextlib.contextmanager
@@ -241,10 +247,19 @@ def _choose_user(ssh_user):
         if sudo_user and sudo_user != 'root':
             ssh_user = sudo_user
         else:
-            with open('/dev/tty', 'r+') as tty:
-                tty.write('SSH-пользователь этого сервера [root]: ')
-                tty.flush()
-                ssh_user = tty.readline().strip() or 'root'
+            try:
+                # A terminal cannot seek. Text r+ uses BufferedRandom and fails
+                # before displaying the prompt; separate handles also work with
+                # curl | sudo bash, whose standard input is the finished pipe.
+                with open('/dev/tty', 'w', encoding='utf-8') as output, open('/dev/tty', 'rb', buffering=0) as terminal:
+                    output.write('SSH-пользователь этого сервера [root]: ')
+                    output.flush()
+                    answer = terminal.readline()
+                if not answer:
+                    raise LinkError('Ввод прерван. Повторите подготовку или укажите --ssh-user USER.')
+                ssh_user = answer.decode('utf-8').strip() or 'root'
+            except OSError:
+                raise LinkError('Нет доступа к интерактивному терминалу. Укажите --ssh-user USER.') from None
     if not isinstance(ssh_user, str) or not USER.fullmatch(ssh_user):
         raise LinkError('Некорректное имя SSH-пользователя.')
     account = pwd.getpwnam(ssh_user)
@@ -261,17 +276,24 @@ def _save_meta(value):
 
 def prepare_chat(chat_root, ssh_user=None):
     """Export existing key material to the SSH user's private transfer directory."""
+    stage = 'проверка каталога установки'
     try:
         _root_required()
         root = _absolute(chat_root)
         _private_directory(root, ROOT_UID, 0)
         _private_directory(STATE_DIR, ROOT_UID, 0, create=True)
+        stage = 'получение блокировки'
         with _lock(STATE_DIR / '.lock'), _lock(root / '.lock'):
+            stage = 'проверка релиза'
             _release(root)
+            stage = 'чтение параметров установки'
             state = json.loads(_read(root / 'installation.json')[0])
             host = str(ipaddress.ip_address(state['public_ip']))
+            stage = 'чтение исходных ключей'
             key = _current_key(root, include_private=True)
+            stage = 'выбор SSH-пользователя'
             username, account, home = _choose_user(ssh_user)
+            stage = 'подготовка каталога обмена'
             transfer = home / TRANSPORT
             _private_directory(transfer, account.pw_uid, account.pw_gid, create=True)
             metadata_path = STATE_DIR / 'metadata.json'
@@ -284,8 +306,10 @@ def prepare_chat(chat_root, ssh_user=None):
                         and old.get('ssh_user') == username and old.get('key_id') == key['key_id']
                         and NONCE.fullmatch(str(old.get('nonce', '')))):
                     nonce = old['nonce']
+            stage = 'сохранение помощника подключения'
             _private_directory(HELPER.parent, ROOT_UID, 0, create=True)
             _write(HELPER, Path(__file__).read_bytes(), uid=ROOT_UID)
+            stage = 'сохранение пакета обмена'
             metadata = {'version':1, 'chat_root':str(root), 'nonce':nonce, 'key_id':key['key_id'],
                         'ssh_user':username, 'uid':account.pw_uid, 'gid':account.pw_gid,
                         'home':str(home), 'transport':str(transfer), 'phase':'prepared'}
@@ -296,8 +320,19 @@ def prepare_chat(chat_root, ssh_user=None):
             print('Подготовка завершена. На VPS сервера ключей выполните вторую команду:')
             print("curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- connect-chat --chat " + shlex.quote(destination))
             return 0
-    except (Exception, KeyboardInterrupt):
-        print('Ошибка подготовки подключения. Проверьте установку, исходные ключи и права SSH-пользователя.', file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as error:
+        if isinstance(error, LinkError):
+            detail = str(error)  # LinkError contains only our public diagnostics.
+        elif isinstance(error, FileNotFoundError):
+            detail = 'Не найден обязательный файл или каталог: ' + str(error.filename or chat_root)
+        elif isinstance(error, PermissionError):
+            detail = 'Нет доступа к файлу или каталогу: ' + str(error.filename or chat_root)
+        elif isinstance(error, KeyboardInterrupt):
+            detail = 'Подготовка прервана пользователем.'
+        else:
+            # Arbitrary exception text may contain malformed JSON/key material.
+            detail = f'Не удалось выполнить этап ({type(error).__name__}). Проверьте параметры установки.'
+        print(f'Ошибка подготовки подключения [{stage}]: {detail}', file=sys.stderr)
         return 41
 
 

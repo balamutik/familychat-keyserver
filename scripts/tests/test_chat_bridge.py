@@ -6,10 +6,15 @@ import io
 import json
 import os
 from pathlib import Path
+import pty
+import select
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -125,6 +130,70 @@ class ChatBridgeTests(unittest.TestCase):
         self.assertIn('connect-chat --chat alice@213.155.29.175', self.output.getvalue())
         self.assertNotIn(self.private, self.output.getvalue() + self.errors.getvalue())
         self.assertEqual((self.root / '.env').read_bytes(), self.env)
+
+    def test_root_prompt_reads_real_terminal_with_closed_pipe_stdin(self):
+        for answer, expected in ((b'\n', 'root'), (b'alice\n', 'alice')):
+            with self.subTest(expected=expected):
+                program = '''import importlib.util, os, types
+spec = importlib.util.spec_from_file_location('terminal_bridge', %r)
+bridge = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bridge)
+bridge.pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid(), pw_dir=%r)
+os.dup2(os.open('/dev/null', os.O_RDONLY), 0)
+print('SELECTED=' + bridge._choose_user(None)[0], flush=True)
+''' % (str(BRIDGE_PATH.resolve()), str(self.home))
+                pid, master = pty.fork()
+                if pid == 0:
+                    env = dict(os.environ, SUDO_USER='root', PYTHONDONTWRITEBYTECODE='1')
+                    os.execve(sys.executable, [sys.executable, '-c', program], env)
+                output = bytearray()
+                reaped = False
+                try:
+                    os.write(master, answer)
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        readable, _, _ = select.select([master], [], [], 0.2)
+                        if readable:
+                            try:
+                                chunk = os.read(master, 4096)
+                            except OSError:
+                                break
+                            if not chunk:
+                                break
+                            output.extend(chunk)
+                    else:
+                        self.fail('Root prompt hung: ' + output.decode(errors='replace'))
+                    _, status = os.waitpid(pid, 0)
+                    reaped = True
+                    self.assertEqual(os.waitstatus_to_exitcode(status), 0, output.decode(errors='replace'))
+                    self.assertIn(('SELECTED=' + expected).encode(), output)
+                    self.assertIn('SSH-пользователь'.encode(), output)
+                finally:
+                    os.close(master)
+                    if not reaped:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+
+    def test_prepare_diagnostic_names_stage_and_missing_path_without_private_material(self):
+        (self.release / 'release.json').unlink()
+        self.assertEqual(bridge.prepare_chat(self.root, 'alice'), 41)
+        message = self.errors.getvalue()
+        self.assertIn('проверка релиза', message)
+        self.assertIn(str(self.release / 'release.json'), message)
+        self.assertNotIn(self.private, message)
+        self.assertNotIn('keep-this-secret', message)
+
+    def test_prepare_shows_actionable_public_validation_error(self):
+        (self.release / 'release.json').write_text('{"external_key_service":0}')
+        self.assertEqual(bridge.prepare_chat(self.root, 'alice'), 41)
+        self.assertIn('Сначала обновите основной сервер', self.errors.getvalue())
+
+    def test_unexpected_prepare_error_never_echoes_exception_secret(self):
+        with mock.patch.object(bridge, '_current_key', side_effect=ValueError(self.private)):
+            self.assertEqual(bridge.prepare_chat(self.root, 'alice'), 41)
+        message = self.errors.getvalue()
+        self.assertIn('чтение исходных ключей', message)
+        self.assertNotIn(self.private, message)
 
     def test_finish_applies_same_key_and_keeps_durable_backup_without_private_key_copy(self):
         nonce = self.prepare()

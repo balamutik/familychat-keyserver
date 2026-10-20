@@ -36,7 +36,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-ke
 Чтобы закрепить версию, используйте её URL и первым аргументом ту же версию:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.5/install.sh | sudo bash -s -- v1.0.5
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.6/install.sh | sudo bash -s -- v1.0.6
 ```
 
 ### Новый чат: свободный порт 80
@@ -140,7 +140,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-ke
 curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- prepare-chat
 ```
 
-Первая команда подготовит закрытый временный пакет для текущего SSH-пользователя и выведет готовую вторую команду с адресом VPS чата. При запуске из-под root имя SSH-пользователя будет запрошено. Можно указать `--ssh-user USER` и, для нестандартной установки, `--chat-root /путь`.
+Первая команда подготовит закрытый временный пакет для текущего SSH-пользователя и выведет готовую вторую команду с адресом VPS чата. При запуске из-под root имя SSH-пользователя будет запрошено; Enter выбирает `root`. Можно указать `--ssh-user USER` и, для нестандартной установки, `--chat-root /путь`. В версии v1.0.6 исправлен ввод из терминала при запуске от root через `curl | sudo bash`. Если подготовка не выполнена, сообщение указывает этап и безопасную причину ошибки без содержимого ключей.
 
 **2. На VPS сервера ключей:**
 
