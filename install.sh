@@ -4,18 +4,22 @@ set -euo pipefail
 run_controller() {
     local payload="$1" action="$2"
     shift 2
-    python3 "$payload/scripts/manage.py" "$action" --source "$payload" "$@"
+    case "$action" in
+        prepare-chat) python3 "$payload/scripts/chat_bridge.py" "$action" "$@" ;;
+        connect-chat) python3 "$payload/scripts/link_chat.py" "$action" "$@" ;;
+        *) python3 "$payload/scripts/manage.py" "$action" --source "$payload" "$@" ;;
+    esac
 }
 main() {
     local selected_version="" action=install controller_args=() answer dependency temp cleanup
     if [[ "${1:-}" == --help ]]; then
-        printf 'FamilyChat keyserver: sudo bash install.sh [vX.Y.Z] [install|update] [options]\nOptions are forwarded to scripts/manage.py; prompts use /dev/tty.\n'
+        printf 'FamilyChat keyserver: sudo bash install.sh [vX.Y.Z] [install|update|prepare-chat|connect-chat] [options]\nprepare-chat runs on the chat VPS; connect-chat runs on the keyserver VPS. Prompts use /dev/tty.\n'
         return
     fi
     if [[ "${1:-}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         selected_version="$1"; shift
     fi
-    if [[ "${1:-}" == install || "${1:-}" == update ]]; then
+    if [[ "${1:-}" == install || "${1:-}" == update || "${1:-}" == prepare-chat || "${1:-}" == connect-chat ]]; then
         action="$1"; shift
     fi
     controller_args=("$@")
@@ -68,7 +72,7 @@ try:
     if expected != [hashlib.sha256(data).hexdigest()]:
         raise ValueError('SHA256 архива не совпадает')
     allowed = {'compose.yaml', 'release.json', 'README.md', 'scripts/manage.py', 'scripts/install.sh',
-               'scripts/update.sh', 'scripts/renew.sh', 'scripts/backup.sh'}
+               'scripts/update.sh', 'scripts/renew.sh', 'scripts/backup.sh', 'scripts/chat_bridge.py', 'scripts/link_chat.py'}
     with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
         unpacked = compressed.read(limit + 1)
     if len(unpacked) > limit:

@@ -31,6 +31,8 @@ class ReleaseTests(unittest.TestCase):
             with tarfile.open(output / 'familychat-keyserver.tar.gz') as archive:
                 names = archive.getnames()
                 self.assertIn('scripts/manage.py', names)
+                self.assertIn('scripts/chat_bridge.py', names)
+                self.assertIn('scripts/link_chat.py', names)
                 self.assertIn('scripts/renew.sh', names)
                 self.assertNotIn('go.mod', names)
                 self.assertNotIn('state/state.json', names)

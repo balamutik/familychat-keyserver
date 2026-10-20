@@ -19,7 +19,7 @@ IMAGE = 'ghcr.io/balamutik/familychat-keyserver@sha256:' + 'b' * 64
 
 def bundle(changes=None, extra=None, padding=0):
     files = dict.fromkeys(('README.md', 'scripts/manage.py', 'scripts/install.sh', 'scripts/update.sh',
-                          'scripts/renew.sh', 'scripts/backup.sh'), b'echo fixture\n')
+                          'scripts/renew.sh', 'scripts/backup.sh', 'scripts/chat_bridge.py', 'scripts/link_chat.py'), b'echo fixture\n')
     files['release.json'] = json.dumps(dict(version='v1.2.3', image=IMAGE, repository='balamutik/familychat-keyserver')).encode()
     files['compose.yaml'] = ('services:\n  keyserver:\n    image: ' + IMAGE + '\n').encode()
     files.update(changes or {})
@@ -96,6 +96,15 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split('\0')[:-1], ['/tmp/release/scripts/manage.py', 'update', '--source',
                          '/tmp/release', '--certbot-dns-args', '/root/dns credentials.json', '--webroot', '/srv/acme challenges'])
+
+    def test_link_actions_dispatch_without_manage_source_argument(self):
+        for action, entry, args in (('prepare-chat', 'chat_bridge.py', ['--ssh-user', 'family']),
+                                    ('connect-chat', 'link_chat.py', ['--chat', 'family@chat.example.com'])):
+            script = 'source "$1" --help >/dev/null\nshift\npython3() { printf "%s\\0" "$@"; }\nrun_controller "/tmp/release" "$@"'
+            result = subprocess.run(['bash', '-c', script, 'test', str(BOOTSTRAP), action, *args],
+                                    input='', capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.split('\0')[:-1], ['/tmp/release/scripts/' + entry, action, *args])
 
 
 if __name__ == '__main__':

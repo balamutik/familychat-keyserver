@@ -18,7 +18,8 @@ def package(version, image, output):
     if not re.fullmatch(r'ghcr\.io/balamutik/familychat-keyserver@sha256:[a-f0-9]{64}', image):
         raise ValueError('image must be the immutable public keyserver GHCR digest')
     files = {name: (ROOT / name).read_bytes() for name in (
-        'README.md', 'scripts/manage.py', 'scripts/install.sh', 'scripts/update.sh', 'scripts/renew.sh', 'scripts/backup.sh')}
+        'README.md', 'scripts/manage.py', 'scripts/install.sh', 'scripts/update.sh', 'scripts/renew.sh',
+        'scripts/backup.sh', 'scripts/chat_bridge.py', 'scripts/link_chat.py')}
     compose = (ROOT / 'compose.yaml').read_text()
     build = '    build:\n      context: ${KEYSERVER_BUILD_CONTEXT:-.}\n'
     if compose.count(build) != 1:
