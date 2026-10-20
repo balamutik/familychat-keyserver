@@ -36,7 +36,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-ke
 Чтобы закрепить версию, используйте её URL и первым аргументом ту же версию:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.2/install.sh | sudo bash -s -- v1.0.2
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.3/install.sh | sudo bash -s -- v1.0.3
 ```
 
 ### Новый чат: свободный порт 80
@@ -155,6 +155,46 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-ke
 
 Импорт проверяет соответствие половин ключа и SHA-256 отпечатка. Конфликт с уже созданным состоянием завершается ошибкой; подмены и автоматической ротации нет. Резервную копию старого ключа сохраняйте отдельно; перенос не меняет ключ для исторических данных.
 
+### Если оба сервера уже установлены с разными ключами
+
+Сообщение `Новый ключ не совпадает с текущим` означает, что нужно перенести **исходные ключи чата на сервер ключей**. Существующий чат и его БД сохраняются. Для нового keyserver, который ещё не подключён к чату, в версии **v1.0.3+** есть отдельная команда `import-keys`. Она проверяет пару в отдельном каталоге, сохраняет закрытую резервную копию прежнего состояния и переключает только службу ключей. При ошибке запуска восстанавливает прежнее состояние и запускает службу с ним. Сертификат, ACME, адрес и порт сохраняются.
+
+1. На сервере чатов подготовьте закрытые копии исходной пары и перенесите их по SSH. Замените `SSH_USER@KEYSERVER` на пользователя и адрес VPS сервера ключей:
+
+```bash
+mkdir -p -m 700 "$HOME/familychat-key-import"
+sudo install -o "$(id -u)" -g "$(id -g)" -m 600 \
+  /opt/familychat/secrets/content-public-key.txt \
+  /opt/familychat/secrets/content-private-key.txt \
+  "$HOME/familychat-key-import/"
+scp -r "$HOME/familychat-key-import" SSH_USER@KEYSERVER:
+```
+
+2. На сервере ключей обновите установщик и импортируйте пару:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- update
+sudo python3 /opt/familychat-keyserver/app/scripts/manage.py import-keys \
+  --import-public "$HOME/familychat-key-import/content-public-key.txt" \
+  --import-private "$HOME/familychat-key-import/content-private-key.txt" \
+  --replace-unused-state
+sudo install -o "$(id -u)" -g "$(id -g)" -m 600 \
+  /opt/familychat-keyserver/export/main-server.json "$HOME/main-server.json"
+```
+
+Параметр `--replace-unused-state` явно разрешает заменить отдельную пару ещё не подключённого keyserver. Не используйте его для ротации ключей другого действующего чата. Если импортируется уже установленная пара, команда ничего не заменяет и сохраняет прежний секрет билетов без перезапуска. Для старого JSON вместо двух параметров используйте `--import-json /закрытый/путь/key.json`. Файлы импорта должны находиться вне заменяемых каталогов `state/` и `export/`.
+
+3. На сервере чатов заново скачайте **обновлённый** файл подключения:
+
+```bash
+scp SSH_USER@KEYSERVER:main-server.json "$HOME/main-server.json"
+chmod 600 "$HOME/main-server.json"
+sudo familychat configure-key-server --key-service-config "$HOME/main-server.json"
+sudo familychat status
+```
+
+Резервная копия прежнего keyserver сохраняется в `/opt/familychat-keyserver/backups/before-key-import-*.tar.gz` с правами `0600`. При неудаче автоматического восстановления команда выводит путь к резервной копии и каталогу восстановления; сохраните их. После успешного подключения проверьте старые сообщения и вложения, затем перенесите прежние приватные копии и резервные копии за пределы основного VPS по правилам ниже. Команда не удаляет исходные файлы импорта или данные основного сервера.
+
 После успешного переключения основного приложения и проверки истории перенесите все прежние копии приватного ключа, старый том ключей и содержащие их резервные копии **за пределы основного хоста**. Одного отключения Docker secret недостаточно, если исходный файл остаётся на диске основной VPS. Скрипты этого сервиса не удаляют чужие файлы и тома автоматически.
 
 ## Подключение основного приложения
@@ -192,7 +232,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-ke
 Обновление до определённой версии:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.2/install.sh | sudo bash -s -- v1.0.2 update
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.3/install.sh | sudo bash -s -- v1.0.3 update
 ```
 
 Для нестандартного каталога добавьте `--install-dir /opt/your-keyserver`. Скрипт проверяет новый комплект, создаёт закрытую резервную копию, загружает неизменяемый образ и пересоздаёт только службу `keyserver` своего Compose-проекта. Состояние ключей, секрет билетов, TLS, ACME и DNS-настройки сохраняются. Команда `init` при обновлении не вызывается; ротации ключей нет. До обновления дождитесь завершения резервной копии; при ошибке не удаляйте состояние и не запускайте новую установку.

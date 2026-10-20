@@ -607,6 +607,79 @@ def update(args, root):
     print("Сервер ключей обновлён. Ключи и билеты сохранены; резервная копия создана")
 
 
+def import_keys(args, root):
+    """Import the chat's established pair into a newly installed, unused service."""
+    config = load_config(root)
+    if bool(args.import_json) == bool(args.import_public or args.import_private):
+        raise ValueError('Укажите --import-json либо пару --import-public и --import-private')
+    if not args.import_json and not (args.import_public and args.import_private):
+        raise ValueError('Нужны оба файла: --import-public и --import-private')
+    for name in ('state', 'export'):
+        if (root / name).is_symlink() or not (root / name).is_dir():
+            raise ValueError('Сначала восстановите исходные каталоги state и export из резервной копии')
+    original = json.loads(restricted_file(root / 'state/state.json').read_text())
+    stage = Path(tempfile.mkdtemp(prefix='.key-import-', dir=root))
+    stopped = False
+    archive = None
+    try:
+        for name in ('state', 'export'):
+            protect_tree(stage / name)
+        initialize = ['docker', 'run', '--rm', '--network', 'none', '--user', '0:0',
+                      '--mount', f'type=bind,src={stage}/state,dst=/state',
+                      '--mount', f'type=bind,src={stage}/export,dst=/export']
+        imports = []
+        for name in ('import_json', 'import_public', 'import_private'):
+            source = getattr(args, name)
+            if source:
+                source = restricted_file(source).resolve()
+                if any(source.is_relative_to((root / directory).resolve()) for directory in ('state', 'export')):
+                    raise ValueError('Файлы импорта должны находиться вне заменяемых каталогов state и export')
+                target = '/import/' + name
+                initialize += ['--mount', f'type=bind,src={source},dst={target},readonly']
+                imports += ['--' + name.replace('_', '-'), target]
+        initialize += [config.get('image', IMAGE), 'init', '--state-dir', '/state',
+                       '--url', server_url(config) + '/api/v1/keys/current',
+                       '--export', '/export/main-server.json', *imports]
+        # The Go CLI validates the imported key pair before any live state changes.
+        command(initialize)
+        candidate = json.loads(restricted_file(stage / 'state/state.json').read_text())
+        if candidate['key_id'] == original['key_id']:
+            print('Эта пара уже используется. Ключи и секрет билетов сохранены; импорт не требуется')
+            shutil.rmtree(stage)
+            return
+        if not args.replace_unused_state:
+            raise RuntimeError('У сервера уже другая пара. Для ещё не подключённого сервера добавьте --replace-unused-state; прежняя пара будет сохранена в резервной копии')
+        archive = root / 'backups' / datetime.now(timezone.utc).strftime('before-key-import-%Y%m%dT%H%M%S.%fZ.tar.gz')
+        backup(root, archive)
+        protect_tree(stage / 'state', 10001)
+        stopped = True
+        compose(root, 'stop', 'keyserver')
+        for name in ('state', 'export'):
+            (root / name).rename(stage / ('previous-' + name))
+            (stage / name).rename(root / name)
+        # Recreate to bind the new directories rather than the old directory inodes.
+        compose(root, 'up', '-d', '--force-recreate', '--wait', '--wait-timeout', '60', 'keyserver')
+    except (Exception, KeyboardInterrupt) as error:
+        if not stopped:
+            shutil.rmtree(stage)
+            raise
+        try:
+            for name in ('state', 'export'):
+                previous = stage / ('previous-' + name)
+                if previous.exists():
+                    if (root / name).exists():
+                        (root / name).rename(stage / ('rejected-' + name))
+                    previous.rename(root / name)
+            compose(root, 'up', '-d', '--force-recreate', '--wait', '--wait-timeout', '60', 'keyserver')
+        except (Exception, KeyboardInterrupt) as rollback_error:
+            raise RuntimeError(f'Не удалось завершить импорт или автоматический запуск. Резервная копия: {archive}. Каталог восстановления: {stage}. Не удаляйте их') from rollback_error
+        shutil.rmtree(stage)
+        raise RuntimeError('Импорт не применён: прежние ключи, секрет билетов и работа службы восстановлены') from error
+    shutil.rmtree(stage)
+    print(f'Ключи чата импортированы. Резервная копия прежнего состояния: {archive}\n'
+          f'Повторно скопируйте {root}/export/main-server.json на сервер чатов и выполните configure-key-server. Сертификат и адрес сохранены')
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description="Отдельный сервер ключей FamilyChat")
@@ -620,15 +693,20 @@ def main():
     update_parser = commands.add_parser("update")
     update_parser.add_argument("--source", default=str(SOURCE))
     commands.add_parser("renew")
+    importer = commands.add_parser('import-keys')
+    for option in ('import-json', 'import-public', 'import-private'):
+        importer.add_argument('--' + option)
+    importer.add_argument('--replace-unused-state', action='store_true',
+                          help='заменить отдельную пару ещё не подключённого keyserver с резервной копией')
     archive = commands.add_parser("backup")
     archive.add_argument("--output")
-    for sub in (setup, update_parser, commands.choices["renew"], archive):
+    for sub in (setup, update_parser, commands.choices["renew"], archive, importer):
         sub.add_argument("--install-dir", default=DEFAULT_INSTALL)
     args = parser.parse_args()
     validate_install_dir(args.install_dir)
     if os.geteuid() != 0:
         raise RuntimeError("Запустите скрипт через sudo: он управляет Docker и закрытыми файлами ключей")
-    if args.command == "update":
+    if args.command in ('update', 'import-keys'):
         ensure_docker()
     root = Path(args.install_dir).resolve()
     with deployment_lock(root):
@@ -642,6 +720,8 @@ def main():
             print(f"Резервная копия создана: {output}. Храните её отдельно от этой машины")
         elif args.command == "update":
             update(args, root)
+        elif args.command == 'import-keys':
+            import_keys(args, root)
 
 
 if __name__ == "__main__":
