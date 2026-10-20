@@ -310,6 +310,19 @@ def connect_chat(args, root, manager):
         print('Проверьте открытие старых сообщений в приложении. Исходные файлы ключей на VPS чата пока сохранены.')
 
 
+def ensure_keyserver_protocol(manager, root, source):
+    manifest = manager.release_manifest(source)
+    if not manifest:
+        return
+    installed_manifest = root / 'app/release.json'
+    installed = json.loads(installed_manifest.read_text()) if installed_manifest.is_file() else {}
+    committed = manager.load_config(root)
+    if (installed.get('key_delivery') != 'device-grant-v1' or installed.get('image') != manifest['image']
+            or committed.get('key_delivery') != 'device-grant-v1' or committed.get('image') != manifest['image']):
+        print('Обновляю сервер ключей для одноразовых допусков устройств…', flush=True)
+        manager.update(argparse.Namespace(source=str(source)), root)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['connect-chat'])
@@ -333,6 +346,8 @@ def main():
     manager.ensure_docker()
     root = args.install_dir.resolve()
     with manager.deployment_lock(root):
+        source = Path(__file__).resolve().parents[1]
+        ensure_keyserver_protocol(manager, root, source)
         connect_chat(args, root, manager)
 
 

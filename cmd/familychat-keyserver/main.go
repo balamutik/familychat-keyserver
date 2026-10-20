@@ -70,6 +70,7 @@ func run(args []string, out io.Writer) error {
 		_, err = fmt.Fprintln(out, "Key server configured; restricted integration JSON written. Keep a separate backup of the state directory.")
 		return err
 	case "serve":
+		grantsDir := flags.String("grants-dir", "/grants", "restricted writable persistent grants directory")
 		dir := flags.String("state-dir", "/var/lib/familychat-keyserver", "restricted state directory")
 		listen := flags.String("listen", ":8443", "dedicated HTTPS listen address")
 		cert := flags.String("tls-cert", "", "TLS full-chain PEM file")
@@ -93,11 +94,18 @@ func run(args []string, out io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("load TLS certificate: %w", err)
 		}
-		server := &http.Server{Addr: *listen, Handler: keyservice.NewHandler(state), TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
+		grants, err := keyservice.OpenGrantStore(*grantsDir)
+		if err != nil {
+			return fmt.Errorf("open persistent grants: %w", err)
+		}
+		defer grants.Close()
+		server := &http.Server{Addr: *listen, Handler: keyservice.NewHandler(state, grants), TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		done := make(chan struct{})
+		shutdownDone := make(chan struct{})
 		go func() {
+			defer close(shutdownDone)
 			select {
 			case <-ctx.Done():
 				shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -109,6 +117,7 @@ func run(args []string, out io.Writer) error {
 		_, _ = fmt.Fprintln(out, "FamilyChat key server listening over HTTPS on "+*listen)
 		err = server.ListenAndServeTLS("", "")
 		close(done)
+		<-shutdownDone
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}

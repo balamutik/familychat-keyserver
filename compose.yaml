@@ -25,6 +25,11 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: bind
+        source: ${KEYSERVER_GRANTS_DIR:-./grants}
+        target: /grants
+        bind:
+          create_host_path: false
     healthcheck:
       test: [CMD, /familychat-keyserver, health, --url, "https://${KEYSERVER_DOMAIN:-localhost}:8443/health/ready", --connect, "127.0.0.1:8443", --ca, /tls/fullchain.pem]
       interval: 30s

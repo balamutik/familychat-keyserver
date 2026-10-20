@@ -89,6 +89,19 @@ class LinkChatTests(unittest.TestCase):
         self.assertNotIn(self.payload['key']['private_key'], output.getvalue())
         self.assertNotIn('new-ticket', output.getvalue())
 
+    def test_staged_release_manifest_does_not_skip_interrupted_upgrade(self):
+        manifest = {'image': 'new-image', 'key_delivery': 'device-grant-v1'}
+        (self.root / 'app').mkdir()
+        self.write(self.root / 'app/release.json', manifest)
+        self.manager.release_manifest.return_value = manifest
+        self.manager.load_config.return_value = {'image': 'old-image'}
+        self.link.ensure_keyserver_protocol(self.manager, self.root, self.root / 'source')
+        self.manager.update.assert_called_once()
+        self.manager.update.reset_mock()
+        self.manager.load_config.return_value = manifest
+        self.link.ensure_keyserver_protocol(self.manager, self.root, self.root / 'source')
+        self.manager.update.assert_not_called()
+
     def test_confirmed_chat_rollback_restores_keyserver_originals(self):
         self.peer.finish.return_value = 41
         before = [(self.root / name).read_bytes() for name in ('state/state.json', 'export/main-server.json')]

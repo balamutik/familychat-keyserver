@@ -1,5 +1,5 @@
 // Package keyservice stores one family's existing fc1 key and distributes it
-// directly to clients authorized by short-lived main-server tickets.
+// directly to devices that prove possession of a one-use persistent grant.
 package keyservice
 
 import (

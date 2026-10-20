@@ -47,7 +47,7 @@ class ChatBridgeTests(unittest.TestCase):
         # Pin the real main-server controller so this separate repository's tests
         # also work in CI and standalone clones without a sibling server checkout.
         shutil.copyfile(Path(__file__).parent / 'fixtures/familychat_controller.py', self.release / 'scripts/familychat.py')
-        (self.release / 'release.json').write_text('{"external_key_service":1}')
+        (self.release / 'release.json').write_text('{"external_key_service":1,"device_key_grants":1}')
         (self.release / 'compose.keyserver.yaml').touch()
         (self.root / 'current').symlink_to(self.release)
         (self.root / 'secrets').mkdir(mode=0o700)
@@ -131,6 +131,45 @@ class ChatBridgeTests(unittest.TestCase):
         self.assertNotIn(self.private, self.output.getvalue() + self.errors.getvalue())
         self.assertEqual((self.root / '.env').read_bytes(), self.env)
 
+    def test_prepare_upgrades_legacy_main_before_exporting_keys(self):
+        manifest = self.release / 'release.json'
+        manifest.write_text('{"external_key_service":1}')
+        controller = mock.Mock()
+        controller.main.side_effect = lambda args: manifest.write_text('{"external_key_service":1,"device_key_grants":1}')
+        with mock.patch.object(bridge, '_controller', return_value=controller):
+            bridge.ensure_chat_protocol(self.root)
+            bridge.ensure_chat_protocol(self.root)
+        controller.main.assert_called_once_with(['--root', str(self.root), 'update'])
+        self.assertEqual((self.root / '.env').read_bytes(), self.env)
+
+    def test_prepare_rejects_update_without_device_grant_support(self):
+        (self.release / 'release.json').write_text('{"external_key_service":1}')
+        with mock.patch.object(bridge, '_controller', return_value=mock.Mock()), self.assertRaises(bridge.LinkError):
+            bridge.ensure_chat_protocol(self.root)
+        self.assertFalse(self.transport.exists())
+
+    def test_prepare_upgrades_chat_predating_external_key_service(self):
+        manifest = self.release / 'release.json'
+        manifest.write_text('{"content_encryption":2}')
+        (self.release / 'compose.keyserver.yaml').unlink()
+        controller = mock.Mock()
+        def upgraded(args):
+            manifest.write_text('{"external_key_service":1,"device_key_grants":1}')
+            (self.release / 'compose.keyserver.yaml').touch()
+        controller.main.side_effect = upgraded
+        with mock.patch.object(bridge, '_controller', return_value=controller):
+            bridge.ensure_chat_protocol(self.root)
+        controller.main.assert_called_once_with(['--root', str(self.root), 'update'])
+
+    def test_finish_rejects_legacy_main_before_mutating_configuration(self):
+        nonce = self.prepare()
+        self.connection()
+        (self.release / 'release.json').write_text('{"external_key_service":1}')
+        with self.mock_docker():
+            self.assertEqual(bridge.finish_chat(nonce), 41)
+        self.assertEqual(self.calls, [])
+        self.assertEqual((self.root / '.env').read_bytes(), self.env)
+
     def test_root_prompt_reads_real_terminal_with_closed_pipe_stdin(self):
         for answer, expected in ((b'\n', 'root'), (b'alice\n', 'alice')):
             with self.subTest(expected=expected):
@@ -194,6 +233,18 @@ print('SELECTED=' + bridge._choose_user(None)[0], flush=True)
         message = self.errors.getvalue()
         self.assertIn('чтение исходных ключей', message)
         self.assertNotIn(self.private, message)
+
+    def test_prepare_refreshes_helper_without_resetting_interrupted_apply_journal(self):
+        nonce = self.prepare()
+        metadata_path = bridge.STATE_DIR / 'metadata.json'
+        metadata = json.loads(metadata_path.read_text())
+        metadata.update(phase='applying', backup=str(self.root/'backups'/'original'), config_sha256='keep-digest')
+        self.write(metadata_path, json.dumps(metadata).encode())
+        bridge.HELPER.write_text('old installed helper')
+        self.assertEqual(bridge.prepare_chat(self.root, 'alice'), 0)
+        self.assertEqual(json.loads(metadata_path.read_text()), metadata)
+        self.assertEqual(bridge.HELPER.read_bytes(), BRIDGE_PATH.read_bytes())
+        self.assertEqual(json.loads((self.transport/'payload.json').read_text())['nonce'], nonce)
 
     def test_finish_applies_same_key_and_keeps_durable_backup_without_private_key_copy(self):
         nonce = self.prepare()

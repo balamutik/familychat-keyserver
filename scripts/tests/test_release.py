@@ -84,6 +84,51 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn(IMAGE, (root / 'compose.yaml').read_text())
             self.assertEqual(manage.load_config(root)['release_version'], 'v1.2.3')
             self.assertTrue(list((root / 'backups').glob('*.tar.gz')))
+            self.assertTrue((root / 'grants').is_dir(), 'upgrade must provision writable grant state')
+            journal = b'{"pending":[],"consumed":["keep-replay-protection"]}\n'
+            (root / 'grants/grants.json').write_bytes(journal)
+            with mock.patch.object(manage, 'command'), mock.patch.object(manage, 'install_timer'):
+                manage.update(argparse.Namespace(source=str(payload / 'extracted')), root)
+            self.assertEqual((root / 'grants/grants.json').read_bytes(), journal)
+            self.assertEqual(manage.load_config(root)['key_delivery'], 'device-grant-v1')
+            self.assertTrue(any(self.backup_has_grants(archive, journal) for archive in (root / 'backups').glob('*.tar.gz')))
+
+    @staticmethod
+    def backup_has_grants(path, expected):
+        with tarfile.open(path) as archive:
+            return 'grants/grants.json' in archive.getnames() and archive.extractfile('grants/grants.json').read() == expected
+
+    def test_update_rejects_legacy_protocol_before_changing_installation(self):
+        for installed_manifest in (False, True):
+            with self.subTest(installed_manifest=installed_manifest), tempfile.TemporaryDirectory() as directory:
+                root, payload = Path(directory) / 'installed', Path(directory) / 'release'
+                root.mkdir(); payload.mkdir()
+                self.package(payload)
+                with tarfile.open(payload / 'familychat-keyserver.tar.gz') as archive:
+                    archive.extractall(payload / 'extracted', filter='data')
+                source = payload / 'extracted'
+                manifest = json.loads((source / 'release.json').read_text())
+                if installed_manifest:
+                    (root / 'app').mkdir()
+                    (root / 'app/release.json').write_text(json.dumps(manifest))
+                    (root / 'app/compose.yaml').write_bytes((source / 'compose.yaml').read_bytes())
+                config = dict(install_dir=str(root), domain='keys.example.com', email='admin@example.com', port=8443,
+                              client='certbot', challenge='standalone')
+                if not installed_manifest:
+                    config['key_delivery'] = 'device-grant-v1'
+                manage.private_json(root / 'deploy.json', config)
+                manifest.pop('key_delivery')
+                (source / 'release.json').write_text(json.dumps(manifest))
+                before = (root / 'deploy.json').read_bytes()
+                with mock.patch.object(manage, 'command') as command, self.assertRaisesRegex(ValueError, 'JWT'):
+                    manage.update(argparse.Namespace(source=str(source)), root)
+                command.assert_not_called()
+                self.assertFalse((root / 'backups').exists())
+                self.assertEqual((root / 'deploy.json').read_bytes(), before)
+                (source / 'release.json').unlink()
+                with mock.patch.object(manage, 'command') as command, self.assertRaisesRegex(ValueError, 'JWT'):
+                    manage.update(argparse.Namespace(source=str(source)), root)
+                command.assert_not_called()
 
     def test_source_and_release_updates_can_switch_without_stale_image_or_key_rotation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -132,6 +177,7 @@ class ReleaseTests(unittest.TestCase):
             calls = []
             with mock.patch.object(manage.sys, 'argv', ['manage.py', 'update', '--source', str(ROOT), '--install-dir', str(root)]), \
                     mock.patch.object(manage.os, 'geteuid', return_value=0), \
+                    mock.patch.object(manage.os, 'chown'), \
                     mock.patch.object(manage, 'ensure_docker'), mock.patch.object(manage, 'install_timer'), \
                     mock.patch.object(manage, 'command', side_effect=lambda args, **kw: calls.append(list(map(str, args)))):
                 manage.main()

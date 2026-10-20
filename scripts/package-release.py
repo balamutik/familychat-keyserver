@@ -26,7 +26,8 @@ def package(version, image, output):
         raise ValueError('expected one local build declaration')
     compose = compose.replace(build, '').replace('    image: ${KEYSERVER_IMAGE:-familychat-keyserver:local}\n', f'    image: {image}\n')
     files['compose.yaml'] = compose.encode()
-    files['release.json'] = (json.dumps(dict(version=version, repository=REPOSITORY, image=image), indent=2) + '\n').encode()
+    files['release.json'] = (json.dumps(dict(version=version, repository=REPOSITORY, image=image,
+                                          key_delivery='device-grant-v1'), indent=2) + '\n').encode()
     output.mkdir(parents=True, exist_ok=True)
     with tarfile.open(output / 'familychat-keyserver.tar.gz', 'w:gz') as archive:
         for name, data in files.items():

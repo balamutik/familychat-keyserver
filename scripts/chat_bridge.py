@@ -209,7 +209,7 @@ def _current_key(root, include_private=False):
     return key
 
 
-def _release(root):
+def _release(root, require_external=True):
     # current is the installer's deliberate symlink; its target must stay inside releases.
     release = (root / 'current').resolve(strict=True)
     if release.parent != root / 'releases' or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', release.name):
@@ -219,14 +219,15 @@ def _release(root):
         if info.st_uid != ROOT_UID or info.st_mode & 0o022:
             raise LinkError('Каталог релиза должен принадлежать root.')
     manifest = json.loads(_read(release / 'release.json', owner=ROOT_UID)[0])
-    if type(manifest.get('external_key_service')) is not int or manifest['external_key_service'] < 1:
+    if require_external and (type(manifest.get('external_key_service')) is not int or manifest['external_key_service'] < 1):
         raise LinkError('Сначала обновите основной сервер до релиза с поддержкой сервера ключей.')
-    _read(release / 'compose.keyserver.yaml', 1 << 20, owner=ROOT_UID)
+    if require_external:
+        _read(release / 'compose.keyserver.yaml', 1 << 20, owner=ROOT_UID)
     _read(release / 'scripts/familychat.py', 1 << 20, owner=ROOT_UID)
     return release
 
 
-def _controller(release):
+def _controller(release, require_link=True):
     spec = importlib.util.spec_from_file_location('familychat_installed_link_controller', release / 'scripts/familychat.py')
     module = importlib.util.module_from_spec(spec)
     previous = sys.dont_write_bytecode
@@ -235,7 +236,7 @@ def _controller(release):
         spec.loader.exec_module(module)
     finally:
         sys.dont_write_bytecode = previous
-    for name in ('load_state', 'configure_key_service', 'compose'):
+    for name in (('load_state', 'configure_key_service', 'compose') if require_link else ('main',)):
         if not callable(getattr(module, name, None)):
             raise LinkError('Установленный контроллер FamilyChat не поддерживает подключение.')
     return module
@@ -274,6 +275,29 @@ def _save_meta(value):
     _json_write(STATE_DIR / 'metadata.json', value)
 
 
+def _next_command(username, host):
+    destination = username + '@' + ('[' + host + ']' if ':' in host else host)
+    print('На VPS сервера ключей выполните вторую команду:')
+    print("curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- connect-chat --chat " + shlex.quote(destination))
+
+
+def ensure_chat_protocol(root):
+    """Upgrade using the installed controller before acquiring this helper's lock."""
+    _root_required()
+    root = _absolute(root)
+    release = _release(root, require_external=False)
+    if json.loads(_read(release/'release.json')[0]).get('device_key_grants', 0) >= 1:
+        return
+    module = _controller(release, require_link=False)
+    if not callable(getattr(module, 'main', None)):
+        raise LinkError('Обновите основной сервер командой familychat update.')
+    print('Обновляю сервер чата для поддержки одноразовых допусков устройств…', flush=True)
+    module.main(['--root', str(root), 'update'])
+    release = _release(root)
+    if json.loads(_read(release/'release.json')[0]).get('device_key_grants', 0) < 1:
+        raise LinkError('Основной сервер ещё не поддерживает допуски устройств. Проверьте актуальный релиз.')
+
+
 def prepare_chat(chat_root, ssh_user=None):
     """Export existing key material to the SSH user's private transfer directory."""
     stage = 'проверка каталога установки'
@@ -300,8 +324,15 @@ def prepare_chat(chat_root, ssh_user=None):
             nonce = secrets.token_hex(16)
             if metadata_path.exists() or metadata_path.is_symlink():
                 old = json.loads(_read(metadata_path, owner=ROOT_UID, modes={0o600})[0])
-                if old.get('phase') in ('applying', 'attention'):
-                    raise LinkError('Завершите предыдущее подключение повторной командой на сервере ключей.')
+                if old.get('phase') in ('applying', 'attention', 'applied', 'rolled_back'):
+                    if (old.get('chat_root') != str(root) or old.get('ssh_user') != username or old.get('key_id') != key['key_id']
+                            or not NONCE.fullmatch(str(old.get('nonce', '')))):
+                        raise LinkError('Предыдущее подключение относится к другим настройкам. Сначала восстановите его.')
+                    _private_directory(HELPER.parent, ROOT_UID, 0, create=True)
+                    _write(HELPER, Path(__file__).read_bytes(), uid=ROOT_UID)
+                    print('Помощник обновлён. Сохранён журнал предыдущего подключения.')
+                    _next_command(username, host)
+                    return 0
                 if (old.get('phase') == 'prepared' and old.get('chat_root') == str(root)
                         and old.get('ssh_user') == username and old.get('key_id') == key['key_id']
                         and NONCE.fullmatch(str(old.get('nonce', '')))):
@@ -316,9 +347,8 @@ def prepare_chat(chat_root, ssh_user=None):
             _save_meta(metadata)
             _json_write(transfer / 'payload.json', {'version':1, 'nonce':nonce, 'key':key,
                         'chat_root':str(root), 'ssh_user':username, 'ssh_host':host}, account.pw_uid, account.pw_gid)
-            destination = username + '@' + ('[' + host + ']' if ':' in host else host)
-            print('Подготовка завершена. На VPS сервера ключей выполните вторую команду:')
-            print("curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- connect-chat --chat " + shlex.quote(destination))
+            print('Подготовка завершена.')
+            _next_command(username, host)
             return 0
     except (Exception, KeyboardInterrupt) as error:
         if isinstance(error, LinkError):
@@ -454,6 +484,8 @@ def finish_chat(nonce):
             root = Path(metadata['chat_root'])
             with _lock(root / '.lock'):
                 release = _release(root)
+                if json.loads(_read(release / 'release.json')[0]).get('device_key_grants', 0) < 1:
+                    raise LinkError('Повторите prepare-chat, чтобы обновить сервер чата до протокола устройств.')
                 module = _controller(release)
                 state = module.load_state(root)
                 if _current_key(root)['key_id'] != metadata['key_id']:
@@ -527,7 +559,15 @@ def main(argv=None):
     finish = commands.add_parser('finish-chat')
     finish.add_argument('--nonce', required=True)
     args = parser.parse_args(argv)
-    return prepare_chat(args.chat_root, args.ssh_user) if args.command == 'prepare-chat' else finish_chat(args.nonce)
+    if args.command == 'finish-chat':
+        return finish_chat(args.nonce)
+    try:
+        ensure_chat_protocol(args.chat_root)
+    except Exception as error:
+        detail = str(error) if isinstance(error, LinkError) else type(error).__name__
+        print('Не завершено обновление сервера чата: ' + detail, file=sys.stderr)
+        return 41
+    return prepare_chat(args.chat_root, args.ssh_user)
 
 
 if __name__ == '__main__':

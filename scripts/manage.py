@@ -248,6 +248,14 @@ def prepare_image(root, manifest):
     return IMAGE
 
 
+def key_delivery(source, manifest=None):
+    metadata = manifest
+    marker = Path(source) / 'key-delivery.json'
+    if metadata is None:
+        metadata = json.loads(marker.read_text()) if marker.is_file() else {}
+    return metadata.get('key_delivery')
+
+
 def private_json(path, value):
     path = Path(path)
     fd, temporary = tempfile.mkstemp(prefix=".keyserver-", dir=path.parent)
@@ -461,7 +469,7 @@ def copy_source(source, root):
         if staging.exists():
             shutil.rmtree(staging)
         staging.mkdir(mode=0o755)
-        names = ("compose.yaml", "scripts", "README.md", "release.json") if manifest else ("go.mod", "Dockerfile", ".dockerignore", "compose.yaml", "cmd", "internal", "scripts", "README.md")
+        names = ("compose.yaml", "scripts", "README.md", "release.json") if manifest else ("go.mod", "Dockerfile", ".dockerignore", "compose.yaml", "cmd", "internal", "scripts", "README.md", "key-delivery.json")
         for name in names:
             path = source / name
             if path.is_dir():
@@ -476,7 +484,7 @@ def copy_source(source, root):
 
 def backup(root, output):
     root, output = Path(root).resolve(), Path(output).absolute()
-    for name in ("state", "tls", "export", "acme"):
+    for name in ("state", "tls", "export", "acme", "grants"):
         if output.resolve().is_relative_to(root / name):
             raise ValueError("Архив не должен находиться внутри каталогов с ключами, сертификатами или ACME состоянием")
     restricted_file(root / "state/state.json")
@@ -485,7 +493,7 @@ def backup(root, output):
     try:
         with os.fdopen(fd, "wb") as file:
             with tarfile.open(fileobj=file, mode="w:gz") as archive:
-                for name in ("state", "tls", "export", "acme", "deploy.json", "service.env", "compose.yaml", "dns.env", "certbot-dns-args.json", "dns-credentials.ini"):
+                for name in ("state", "tls", "export", "acme", "grants", "deploy.json", "service.env", "compose.yaml", "dns.env", "certbot-dns-args.json", "dns-credentials.ini"):
                     path = root / name
                     if path.exists():
                         archive.add(path, arcname=name, recursive=True)
@@ -527,6 +535,7 @@ def install(args):
     if (root / "deploy.json").exists():
         raise RuntimeError("Сервер уже установлен. Используйте update.sh; ключи не изменены")
     manifest = release_manifest(args.source)
+    config['key_delivery'] = key_delivery(args.source, manifest)
     ensure_docker()
     ensure_acme(config)
     ensure_port_available(config["port"])
@@ -536,6 +545,7 @@ def install(args):
     protect_tree(root / "acme")
     for name in ("state", "tls", "export"):
         protect_tree(root / name)
+    protect_tree(root / 'grants', 10001 if os.geteuid() == 0 else None)
     if config.get("dns_env"):
         source = restricted_file(config["dns_env"])
         read_dns_env(source)
@@ -592,8 +602,14 @@ def update(args, root):
     config = load_config(root)
     source = Path(args.source)
     manifest = release_manifest(source)
+    delivery = key_delivery(source, manifest)
+    installed = release_manifest(root / 'app') if (root / 'app/release.json').is_file() else None
+    floor = config.get('key_delivery') == 'device-grant-v1' or key_delivery(root / 'app', installed) == 'device-grant-v1'
+    if floor and delivery != 'device-grant-v1':
+        raise ValueError('Откат на выдачу ключей по JWT запрещён. Выберите релиз с одноразовыми допусками устройств.')
     output = root / "backups" / datetime.now(timezone.utc).strftime("before-update-%Y%m%dT%H%M%S.%fZ.tar.gz")
     backup(root, output)
+    protect_tree(root / 'grants', 10001 if os.geteuid() == 0 else None)
     copy_source(source, root)
     prepare_image(root, manifest)
     compose(root, "up", "-d", "--wait", "--wait-timeout", "60")
@@ -602,6 +618,7 @@ def update(args, root):
     else:
         config.pop('release_version', None)
         config.pop('image', None)
+    config['key_delivery'] = delivery
     private_json(root / "deploy.json", config)
     install_timer(root)
     print("Сервер ключей обновлён. Ключи и билеты сохранены; резервная копия создана")
