@@ -15,31 +15,32 @@
 
 Механизмы подтверждены официальными инструкциями: [certbot: standalone, webroot, DNS и renewal](https://eff-certbot.readthedocs.io/en/stable/using.html), [acme.sh: получение и установка сертификата](https://github.com/acmesh-official/acme.sh), [DNS-провайдеры acme.sh](https://github.com/acmesh-official/acme.sh/wiki/dnsapi). Нельзя перенаправить ACME-проверку на 8443 простым выбором порта приложения.
 
-## Подготовка отдельного Linux-сервера
+## Установка публичного релиза на отдельный Linux-сервер
 
-Нужны Docker Engine, Docker Compose plugin, Python 3.9+ и выбранный клиент сертификатов. Go на машине установки не нужен: образ собирается в Docker. Исходники этого каталога должны быть скопированы на сервер, например в `~/familychat-keyserver`. Каталоги `state`, `tls`, `acme`, `export`, `backups` с уже работающей машины не копируйте как исходники.
+Публичный репозиторий: [balamutik/familychat-keyserver](https://github.com/balamutik/familychat-keyserver). Поддерживаются Ubuntu/Debian на **amd64 и arm64**. Начальная команда требует `curl` и `sudo`; Python 3 и доверенные CA установщик предложит добавить при отсутствии. Для Docker Engine и Compose plugin используется официальный apt-репозиторий Docker с отдельным подтверждением. Существующий Docker сохраняется; недостающий Compose устанавливается из того же источника. Минимальная версия Compose — 2.24.4.
 
-Для certbot на Debian/Ubuntu:
-
-```bash
-sudo apt update
-sudo apt install -y python3 certbot
-```
-
-Для acme.sh, следуя [официальной инструкции](https://github.com/acmesh-official/acme.sh/wiki/How-to-install), установите его для root без отдельного cron: собственный таймер ниже будет продлевать сертификаты службы.
+Интерактивная установка последнего опубликованного релиза:
 
 ```bash
-git clone --depth 1 https://github.com/acmesh-official/acme.sh.git /tmp/familychat-acme
-sudo /tmp/familychat-acme/acme.sh --install --home /root/.acme.sh --nocron --accountemail admin@example.com
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash
 ```
 
-Далее выберите один вариант получения сертификата. Скрипт без параметров задаст вопросы о домене, email, certbot/acme.sh и способе проверки. По умолчанию установка находится в `/opt/familychat-keyserver`.
+Скрипт задаёт вопросы через `/dev/tty`, поэтому ввод работает и при `curl | sudo bash`. Для запуска без терминала укажите все параметры, а зависимости установите заранее. По умолчанию каталог установки — `/opt/familychat-keyserver`.
+
+**certbot** или **acme.sh** выбирается параметром `--client` либо в диалоге. Если certbot отсутствует, установщик предложит apt-пакет `certbot`. DNS-плагины certbot устанавливаются администратором отдельно. При выборе отсутствующего acme.sh установщик предложит официальный архив версии 3.1.6, закреплённый коммитом и SHA-256, и необходимые `curl`, `openssl`, `socat`. Архив проверяется до исполнения; установка выполняется без собственного cron, продление обслуживает таймер keyserver. Уже установленный клиент используется без переустановки; другой путь acme.sh можно задать через `--acme-binary`.
+
+Релиз содержит готовый публичный образ `ghcr.io/balamutik/familychat-keyserver@sha256:…`; Go, git и сборка приложения на VPS не нужны. Архив `familychat-keyserver.tar.gz` проверяется по `SHA256SUMS`, а его манифест — по репозиторию, версии и неизменяемому образу. Загрузка и распаковка ограничены по размеру; состояние и ключи в релиз не включаются. Начальный `install.sh` и суммы загружаются по HTTPS из одного доверенного GitHub-релиза; контрольная сумма не является отдельной подписью издателя.
+
+Чтобы закрепить версию, используйте её URL и первым аргументом ту же версию:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.0/install.sh | sudo bash -s -- v1.0.0
+```
 
 ### Новый чат: свободный порт 80
 
 ```bash
-cd ~/familychat-keyserver
-sudo ./scripts/install.sh \
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- \
   --domain keys.example.com --email admin@example.com \
   --client certbot --challenge standalone
 ```
@@ -47,19 +48,19 @@ sudo ./scripts/install.sh \
 Или с acme.sh:
 
 ```bash
-sudo ./scripts/install.sh \
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- \
   --domain keys.example.com --email admin@example.com \
   --client acme.sh --challenge standalone --port 8443
 ```
 
-Скрипт соберёт образ, создаст ключи один раз, выпустит сертификат и запустит контейнер. Повторный `install` не заменит ключи; обновлять нужно через `update.sh`.
+Скрипт загрузит готовый образ, создаст ключи один раз тем же образом, выпустит сертификат и запустит контейнер. Повторный `install` не заменит ключи; обновлять нужно через `update.sh`.
 
 ### Когда порт 80 занят: webroot
 
 Укажите каталог, который **уже** отдаётся существующим веб-сервером по адресу `http://keys.example.com/.well-known/acme-challenge/...`. Его маршрутизацию настраивает администратор существующего веб-сервера; установщик её не меняет.
 
 ```bash
-sudo ./scripts/install.sh \
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- \
   --domain keys.example.com --email admin@example.com \
   --client certbot --challenge webroot --webroot /var/www/acme
 ```
@@ -77,7 +78,7 @@ CF_Account_ID=your-account-id
 
 ```bash
 sudo chmod 600 /root/familychat-dns.env
-sudo ./scripts/install.sh \
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- \
   --domain keys.example.com --email admin@example.com \
   --client acme.sh --challenge dns --dns-provider dns_cf \
   --dns-env /root/familychat-dns.env
@@ -99,7 +100,7 @@ sudo apt install python3-certbot-dns-cloudflare
 
 ```bash
 sudo chmod 600 /root/cloudflare.ini /root/familychat-certbot-dns.json
-sudo ./scripts/install.sh \
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- \
   --domain keys.example.com --email admin@example.com \
   --client certbot --challenge dns \
   --certbot-dns-args /root/familychat-certbot-dns.json
@@ -116,7 +117,7 @@ sudo ./scripts/install.sh \
 3. Выполните установку с **импортом**:
 
 ```bash
-sudo ./scripts/install.sh \
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- \
   --domain keys.example.com --email admin@example.com \
   --client certbot --challenge standalone \
   --import-public /root/import/content-public-key.txt \
@@ -126,7 +127,7 @@ sudo ./scripts/install.sh \
 Для прежнего JSON:
 
 ```bash
-sudo ./scripts/install.sh \
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- \
   --domain keys.example.com --email admin@example.com \
   --client certbot --challenge standalone \
   --import-json /root/import/key.json
@@ -162,14 +163,21 @@ curl --fail https://keys.example.com:8443/health/ready
 
 Ответ: `{"status":"ready"}`. Запрос `/api/v1/keys/current` без правильного короткоживущего билета возвращает `401`; постоянный токен сессии FamilyChat не принимается. Данные ключей никогда не помещаются в URL или логи; ответы помечены `Cache-Control: no-store`.
 
-Обновление из новой версии исходников:
+Обновление до последнего опубликованного релиза:
 
 ```bash
-cd ~/familychat-keyserver
-sudo ./scripts/update.sh
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/latest/download/install.sh | sudo bash -s -- update
 ```
 
-Скрипт создаёт резервную копию, собирает новый образ и пересоздаёт только контейнер `familychat-keyserver`. Состояние ключей и секрет билетов сохраняются. Обновление не выпускает новый ключ. TLS-сертификат перечитывается при новых соединениях без перезапуска процесса; при неполной замене пары продолжает работать последний корректный сертификат.
+Обновление до определённой версии:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.0/install.sh | sudo bash -s -- v1.0.0 update
+```
+
+Для нестандартного каталога добавьте `--install-dir /opt/your-keyserver`. Скрипт проверяет новый комплект, создаёт закрытую резервную копию, загружает неизменяемый образ и пересоздаёт только службу `keyserver` своего Compose-проекта. Состояние ключей, секрет билетов, TLS, ACME и DNS-настройки сохраняются. Команда `init` при обновлении не вызывается; ротации ключей нет. До обновления дождитесь завершения резервной копии; при ошибке не удаляйте состояние и не запускайте новую установку.
+
+Установка и обновление **из локальных исходников** также поддерживаются: скопируйте чистый checkout этого репозитория на сервер и выполните `sudo ./scripts/install.sh ...` либо `sudo ./scripts/update.sh`. Тогда используется локальная Docker-сборка. `update.sh` из установленного релизного `app` повторно загружает **тот же закреплённый образ**; для перехода на новый релиз используйте публичную команду выше. TLS-сертификат перечитывается при новых соединениях без перезапуска процесса; при неполной замене пары продолжает работать последний корректный сертификат.
 
 Продление сертификата вручную:
 
@@ -188,7 +196,7 @@ sudo /opt/familychat-keyserver/app/scripts/backup.sh --output /root/keyserver-ba
 
 Архив имеет права `0600`, включает `state/state.json` **вместе с приватным ключом и секретом билетов**, сертификаты, настройки и локально сохранённые DNS данные. Архив не зашифрован дополнительно; храните его в закрытом хранилище вне машины. Существующий файл архива не перезаписывается.
 
-Восстановление на чистой машине: остановите только контейнер ключей, распакуйте архив в `/opt/familychat-keyserver` с сохранением прав, верните исходники в `app`, установите выбранный ACME-клиент и Docker, затем выполните `update.sh` и проверьте readiness. Каталог `state` и его файл должны принадлежать UID/GID `10001:10001`, иметь права `0700/0600`; `tls` также должен читаться этим UID. Если изменился домен/порт или пути DNS, приведите их в `deploy.json` и `service.env` к новой машине, перевыпустите сертификат и заново экспортируйте файл подключения с сохранённым состоянием.
+Восстановление на чистой машине: остановите только контейнер ключей, распакуйте архив в `/opt/familychat-keyserver` с сохранением прав, установите выбранный ACME-клиент и Docker, затем выполните публичную команду обновления с нужной версией; она вернёт релизный комплект в `app` и проверьте readiness. Каталог `state` и его файл должны принадлежать UID/GID `10001:10001`, иметь права `0700/0600`; `tls` также должен читаться этим UID. Если изменился домен/порт или пути DNS, приведите их в `deploy.json` и `service.env` к новой машине, перевыпустите сертификат и заново экспортируйте файл подключения с сохранённым состоянием.
 
 ## CLI без установщика
 
@@ -213,4 +221,9 @@ go test -race ./...
 go vet ./...
 python3 -m unittest discover -s scripts/tests -v
 docker compose config --quiet
+# Проверка релизного комплекта с тестовым digest без запуска контейнеров:
+python3 scripts/package-release.py --version v1.0.0 --image "ghcr.io/balamutik/familychat-keyserver@sha256:$(printf 'a%.0s' {1..64})" --output /tmp/keyserver-release
+python3 scripts/tests/validate_compose.py /tmp/keyserver-release/familychat-keyserver.tar.gz
 ```
+
+Публикация: workflow `.github/workflows/release.yml` запускается по тегу `vX.Y.Z`, тестирует сервис и установщик, собирает образ для amd64/arm64 и выпускает три файла: `install.sh`, `familychat-keyserver.tar.gz`, `SHA256SUMS`. Все используемые Actions закреплены SHA коммитов. Перед публикацией файлов проверяется доступ к образу **без Docker-авторизации**. При первой публикации владелец должен сделать GHCR package публичным в GitHub; если проверка остановит job, смените видимость и повторите запуск. Выпущенные версии не заменяются: для изменения нужен новый тег.

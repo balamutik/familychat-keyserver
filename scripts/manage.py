@@ -4,6 +4,8 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.parse
+import urllib.request
 
 
 SOURCE = Path(__file__).resolve().parent.parent
@@ -26,6 +30,178 @@ IMAGE = "familychat-keyserver:local"
 def command(args, **kwargs):
     # Never print commands: imported file paths/DNS arguments may be sensitive.
     subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+
+# Official acme.sh 3.1.6 commit archive, verified during release development.
+ACME_COMMIT = "807da6498377ee5e0cf43a78091f46f12dc59a89"
+ACME_SHA256 = "ddbe1bcbd1a44a2623a2af167ebdc678669e6e2eb396742f2d1d28e02dc14220"
+REPOSITORY = "balamutik/familychat-keyserver"
+
+
+def prompt(message):
+    try:
+        with open('/dev/tty', 'w', encoding='utf-8') as output, open('/dev/tty', 'rb', buffering=0) as terminal:
+            while True:
+                output.write(message + ' ')
+                output.flush()
+                raw = terminal.readline()
+                if not raw:
+                    raise RuntimeError('Ввод прерван')
+                try:
+                    return raw.decode('utf-8').strip()
+                except UnicodeDecodeError:
+                    output.write('Некорректная кодировка. Введите ответ заново.\n')
+    except OSError as error:
+        raise RuntimeError('Нет терминала /dev/tty. Укажите параметры явно; зависимости установите заранее') from error
+
+
+def approve(message):
+    if prompt(message + ' [y/N]').lower() not in ('y', 'yes', 'д', 'да'):
+        raise RuntimeError('Установка отменена. Подтверждение не получено')
+
+
+def install_packages(packages):
+    approve('Установить пакеты: ' + ', '.join(packages) + '?')
+    command(['apt-get', 'update'])
+    command(['apt-get', 'install', '-y', *packages])
+
+
+class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != 'https':
+            raise ValueError('HTTPS redirect required')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download(url, limit=16 << 20):
+    if urllib.parse.urlsplit(url).scheme != 'https':
+        raise ValueError('HTTPS required')
+    request = urllib.request.Request(url, headers={'User-Agent': 'FamilyChat-keyserver-installer'})
+    with urllib.request.build_opener(HTTPSRedirect()).open(request, timeout=60) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError('Слишком большой установочный файл')
+    return data
+
+
+def system_release():
+    if sys.platform != 'linux':
+        raise RuntimeError('Поддерживаются Ubuntu и Debian')
+    info = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
+    distro, codename = info.get('ID', '').strip('"'), info.get('VERSION_CODENAME', '').strip('"')
+    if distro not in ('ubuntu', 'debian') or not re.fullmatch(r'[a-z]+', codename):
+        raise RuntimeError('Поддерживаются Ubuntu и Debian с VERSION_CODENAME')
+    return distro, codename
+
+
+def compose_supported():
+    try:
+        result = subprocess.run(['docker', 'compose', 'version', '--short'], check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    match = re.match(r'v?(\d+)\.(\d+)\.(\d+)', result.stdout.strip())
+    return bool(match and tuple(map(int, match.groups())) >= (2, 24, 4))
+
+
+def installed_package(name):
+    result = subprocess.run(['dpkg-query', '-W', '-f=${Status}', name], capture_output=True, text=True)
+    return result.returncode == 0 and result.stdout.strip() == 'install ok installed'
+
+
+def ensure_docker():
+    if not shutil.which('docker'):
+        distro, codename = system_release()
+        approve('Docker отсутствует. Установить Docker Engine и Compose из официального apt-репозитория Docker?')
+        command(['apt-get', 'update'])
+        command(['apt-get', 'install', '-y', 'ca-certificates'])
+        key = Path('/etc/apt/keyrings/docker.asc')
+        key.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        key.write_bytes(download(f'https://download.docker.com/linux/{distro}/gpg', limit=1 << 20))
+        key.chmod(0o644)
+        arch = subprocess.run(['dpkg', '--print-architecture'], check=True, capture_output=True, text=True).stdout.strip()
+        if arch not in ('amd64', 'arm64'):
+            raise RuntimeError('Релиз поддерживает только amd64 и arm64')
+        source = Path('/etc/apt/sources.list.d/docker.sources')
+        source.write_text(f'Types: deb\nURIs: https://download.docker.com/linux/{distro}\nSuites: {codename}\nComponents: stable\nArchitectures: {arch}\nSigned-By: {key}\n')
+        source.chmod(0o644)
+        command(['apt-get', 'update'])
+        command(['apt-get', 'install', '-y', 'docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin', 'docker-compose-plugin'])
+        command(['systemctl', 'enable', '--now', 'docker'])
+    command(['docker', 'info'], stdout=subprocess.DEVNULL)
+    if not compose_supported():
+        distro, _ = system_release()
+        if installed_package('docker-ce-cli'):
+            package = 'docker-compose-plugin'
+        elif installed_package('docker.io'):
+            package = 'docker-compose-v2' if distro == 'ubuntu' else 'docker-compose'
+        else:
+            raise RuntimeError('Установите Compose plugin >=2.24.4 из того же источника, что существующий Docker')
+        install_packages([package])
+        if not compose_supported():
+            raise RuntimeError('Требуется Docker Compose plugin >=2.24.4')
+
+
+def ensure_acme(config):
+    if config['client'] == 'certbot':
+        if not shutil.which('certbot'):
+            install_packages(['certbot'])
+        return
+    binary = Path(config['acme_binary'])
+    if binary.is_file():
+        return
+    if not binary.is_absolute() or binary.name != 'acme.sh':
+        raise ValueError('--acme-binary должен быть абсолютным путём к acme.sh')
+    approve('Установить официальный acme.sh 3.1.6 с проверкой SHA-256 в ' + str(binary.parent) + '?')
+    missing = [name for name in ('curl', 'openssl', 'socat') if not shutil.which(name)]
+    if missing:
+        install_packages(missing)
+    data = download('https://codeload.github.com/acmesh-official/acme.sh/tar.gz/' + ACME_COMMIT)
+    if hashlib.sha256(data).hexdigest() != ACME_SHA256:
+        raise ValueError('SHA256 архива acme.sh не совпадает')
+    with tempfile.TemporaryDirectory(prefix='familychat-acme-') as temporary:
+        root = Path(temporary)
+        prefix = 'acme.sh-' + ACME_COMMIT
+        with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+            total, members = 0, []
+            for member in archive:
+                path = Path(member.name)
+                total += member.size
+                if path.is_absolute() or '..' in path.parts or not path.parts or path.parts[0] != prefix or not (member.isfile() or member.isdir()) or total > 32 << 20 or len(members) >= 2048:
+                    raise ValueError('Небезопасный архив acme.sh')
+                members.append(member)
+            for member in members:
+                target = root / member.name
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(archive.extractfile(member).read())
+                    target.chmod(0o700)
+        command(['sh', root / prefix / 'acme.sh', '--install', '--home', binary.parent, '--nocron', '--noprofile', '--accountemail', config['email']], cwd=root / prefix)
+    if not binary.is_file():
+        raise RuntimeError('acme.sh не установлен')
+
+
+def release_manifest(source):
+    source = Path(source)
+    if not (source / 'release.json').exists():
+        return None
+    manifest = json.loads((source / 'release.json').read_text())
+    image = manifest.get('image', '')
+    if manifest.get('repository') != REPOSITORY or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', manifest.get('version', '')) or not re.fullmatch(r'ghcr\.io/balamutik/familychat-keyserver@sha256:[a-f0-9]{64}', image):
+        raise ValueError('Неверный манифест релиза keyserver')
+    compose_text = (source / 'compose.yaml').read_text()
+    if '    image: ' + image + '\n' not in compose_text or re.search(r'^\s*(?:build|include|extends):', compose_text, re.M):
+        raise ValueError('Compose не соответствует образу манифеста')
+    return manifest
+
+
+def prepare_image(root, manifest):
+    if manifest:
+        compose(root, 'pull', 'keyserver')
+        return manifest['image']
+    compose(root, 'build', '--pull')
+    return IMAGE
 
 
 def private_json(path, value):
@@ -208,13 +384,15 @@ def compose(root, *args):
 
 def copy_source(source, root):
     source, root = Path(source).resolve(), Path(root).resolve()
+    manifest = release_manifest(source)
     target = root / "app"
     if target.resolve() != source:
         staging = root / "app.next"
         if staging.exists():
             shutil.rmtree(staging)
         staging.mkdir(mode=0o755)
-        for name in ("go.mod", "Dockerfile", ".dockerignore", "compose.yaml", "cmd", "internal", "scripts", "README.md"):
+        names = ("compose.yaml", "scripts", "README.md", "release.json") if manifest else ("go.mod", "Dockerfile", ".dockerignore", "compose.yaml", "cmd", "internal", "scripts", "README.md")
+        for name in names:
             path = source / name
             if path.is_dir():
                 shutil.copytree(path, staging / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -271,19 +449,16 @@ def deployment_lock(root):
 
 def install(args):
     config = vars(args).copy()
-    for name, prompt, default in (("domain", "Домен сервера ключей", None), ("email", "Email для сертификата", None), ("client", "Клиент сертификатов: certbot или acme.sh", "certbot"), ("challenge", "Проверка домена: standalone, webroot или dns", "standalone")):
+    for name, question, default in (("domain", "Домен сервера ключей", None), ("email", "Email для сертификата", None), ("client", "Клиент сертификатов: certbot или acme.sh", "certbot"), ("challenge", "Проверка домена: standalone, webroot или dns", "standalone")):
         if not config.get(name):
-            if not sys.stdin.isatty():
-                raise ValueError(f"Укажите --{name.replace('_', '-')}")
-            config[name] = input(prompt + (f" [{default}]" if default else "") + ": ").strip() or default
+            config[name] = prompt(question + (f" [{default}]" if default else "") + ":") or default
     validate(config)
-    if config["client"] == "certbot" and not shutil.which("certbot"):
-        raise RuntimeError("Установите certbot (и DNS-плагин при DNS проверке) по инструкции README")
-    if config["client"] == "acme.sh" and not Path(config["acme_binary"]).is_file():
-        raise RuntimeError("Установите acme.sh или укажите --acme-binary /путь/acme.sh; инструкция в README")
     root = Path(config["install_dir"]).resolve()
     if (root / "deploy.json").exists():
         raise RuntimeError("Сервер уже установлен. Используйте update.sh; ключи не изменены")
+    manifest = release_manifest(args.source)
+    ensure_docker()
+    ensure_acme(config)
     ensure_port_available(config["port"])
     if config["challenge"] == "standalone":
         ensure_port_available(80)
@@ -314,7 +489,9 @@ def install(args):
     env = f"KEYSERVER_BUILD_CONTEXT=./app\nKEYSERVER_STATE_DIR=./state\nKEYSERVER_TLS_DIR=./tls\nKEYSERVER_PORT={config['port']}\nKEYSERVER_DOMAIN={config['domain']}\n"
     (root / "service.env").write_text(env)
     (root / "service.env").chmod(0o600)
-    compose(root, "build", "--pull")
+    image = prepare_image(root, manifest)
+    if manifest:
+        config.update(release_version=manifest["version"], image=image)
     initialize = ["docker", "run", "--rm", "--user", "0:0", "--mount", f"type=bind,src={root}/state,dst=/state", "--mount", f"type=bind,src={root}/export,dst=/export"]
     imports = []
     for flag, name in (("--import-json", "import_json"), ("--import-public", "import_public"), ("--import-private", "import_private")):
@@ -323,7 +500,7 @@ def install(args):
             target = "/import/" + name
             initialize += ["--mount", f"type=bind,src={source},dst={target},readonly"]
             imports += [flag, target]
-    initialize += [IMAGE, "init", "--state-dir", "/state", "--url", f"https://{config['domain']}:{config['port']}/api/v1/keys/current", "--export", "/export/main-server.json", *imports]
+    initialize += [image, "init", "--state-dir", "/state", "--url", f"https://{config['domain']}:{config['port']}/api/v1/keys/current", "--export", "/export/main-server.json", *imports]
     command(initialize)
     protect_tree(root / "state", 10001)
     certificate(config)
@@ -337,6 +514,25 @@ def load_config(root):
     config = json.loads(restricted_file(root / "deploy.json").read_text())
     validate(config)
     return config
+
+
+def update(args, root):
+    config = load_config(root)
+    source = Path(args.source)
+    manifest = release_manifest(source)
+    output = root / "backups" / datetime.now(timezone.utc).strftime("before-update-%Y%m%dT%H%M%S.%fZ.tar.gz")
+    backup(root, output)
+    copy_source(source, root)
+    prepare_image(root, manifest)
+    compose(root, "up", "-d", "--wait", "--wait-timeout", "60")
+    if manifest:
+        config.update(release_version=manifest["version"], image=manifest["image"])
+    else:
+        config.pop('release_version', None)
+        config.pop('image', None)
+    private_json(root / "deploy.json", config)
+    install_timer(root)
+    print("Сервер ключей обновлён. Ключи и билеты сохранены; резервная копия создана")
 
 
 def main():
@@ -360,10 +556,8 @@ def main():
     validate_install_dir(args.install_dir)
     if os.geteuid() != 0:
         raise RuntimeError("Запустите скрипт через sudo: он управляет Docker и закрытыми файлами ключей")
-    if args.command != "backup":
-        if not shutil.which("docker"):
-            raise RuntimeError("Установите Docker Engine и Docker Compose plugin")
-        command(["docker", "compose", "version"], stdout=subprocess.DEVNULL)
+    if args.command == "update":
+        ensure_docker()
     root = Path(args.install_dir).resolve()
     with deployment_lock(root):
         if args.command == "install":
@@ -375,14 +569,7 @@ def main():
             backup(root, output)
             print(f"Резервная копия создана: {output}. Храните её отдельно от этой машины")
         elif args.command == "update":
-            load_config(root)
-            output = root / "backups" / datetime.now(timezone.utc).strftime("before-update-%Y%m%dT%H%M%SZ.tar.gz")
-            backup(root, output)
-            copy_source(args.source, root)
-            compose(root, "build", "--pull")
-            compose(root, "up", "-d", "--wait", "--wait-timeout", "60")
-            install_timer(root)
-            print("Сервер ключей обновлён. Ключи и билеты сохранены; резервная копия создана")
+            update(args, root)
 
 
 if __name__ == "__main__":
