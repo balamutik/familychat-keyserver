@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import socket
 import stat
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -86,6 +88,71 @@ class DeployTests(unittest.TestCase):
             self.assertIn("--certificate-profile", args)
             self.assertIn("shortlived", args)
             self.assertEqual(args[args.index("--days") + 1], "3")
+
+    def test_acme_sudo_launch_uses_root_environment_for_issue_renew_and_install_cert(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'client/acme.sh'
+            binary.parent.mkdir()
+            trace = root / 'calls.jsonl'
+            binary.write_text(f'#!{sys.executable}\n' + '''import json, os, pathlib, sys
+args = sys.argv[1:]
+if any(name.startswith('SUDO_') for name in os.environ):
+    print('It seems that you are using sudo')
+    sys.exit(1)
+with open(''' + repr(str(trace)) + ''', 'a') as file:
+    file.write(json.dumps({'args':args, 'home':os.environ['HOME'], 'dns_token':os.environ.get('CF_Token')}) + '\\n')
+if '--install-cert' in args:
+    for flag in ('--key-file', '--fullchain-file'):
+        pathlib.Path(args[args.index(flag) + 1]).write_text('test certificate material')
+sys.exit(2 if '--renew' in args else 0)
+''')
+            binary.chmod(0o700)
+            dns_env = root / 'dns.env'
+            dns_env.write_text('CF_Token=test-dns-token\n')
+            dns_env.chmod(0o600)
+            config = self.config(root, client='acme.sh', acme_binary=str(binary), dns_env=str(dns_env))
+            inherited = dict(SUDO_COMMAND='/usr/bin/bash -s -- --client acme.sh', SUDO_UID='1000',
+                             SUDO_GID='1000', SUDO_USER='family', HOME='/home/family')
+            with mock.patch.dict(os.environ, inherited), mock.patch.object(manage.os, 'geteuid', return_value=0), \
+                    mock.patch('pwd.getpwuid', return_value=mock.Mock(pw_dir='/root')), \
+                    mock.patch.object(manage.os, 'chown'), mock.patch.object(manage, 'ensure_port_available'):
+                try:
+                    manage.certificate(config)
+                    manage.certificate(config, renew=True)
+                except (subprocess.CalledProcessError, RuntimeError) as error:
+                    self.fail(f'ACME inherited sudo metadata from installer: {error}')
+                self.assertEqual(os.environ['SUDO_COMMAND'], inherited['SUDO_COMMAND'])
+                self.assertEqual(os.environ['HOME'], '/home/family')
+            calls = [json.loads(line) for line in trace.read_text().splitlines()]
+            self.assertEqual(len(calls), 5)
+            for call in calls:
+                self.assertEqual(call['home'], '/root')
+                self.assertNotIn('--force', call['args'])
+                self.assertEqual(call['args'][call['args'].index('--home') + 1], str(binary.parent))
+            for call in calls:
+                if '--issue' in call['args'] or '--renew' in call['args']:
+                    self.assertEqual(call['dns_token'], 'test-dns-token')
+
+    def test_acme_environment_preserves_sudo_identity_for_nonroot_process(self):
+        original = dict(SUDO_COMMAND='sudo acme.sh', SUDO_UID='1000', HOME='/home/family', CF_Token='dns-token')
+        with mock.patch.object(manage.os, 'geteuid', return_value=1000):
+            env = manage.acme_environment(original)
+        self.assertEqual(env, original)
+        self.assertIsNot(env, original)
+
+    def test_acme_capability_probe_uses_root_environment(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = Path(root) / 'acme.sh'
+            binary.write_text(f'#!{sys.executable}\nimport os, sys\n'
+                              "sys.exit(1) if any(k.startswith('SUDO_') for k in os.environ) else None\n"
+                              "print('--certificate-profile --days')\n")
+            binary.chmod(0o700)
+            config = self.config(root, domain='213.155.29.175', client='acme.sh', acme_binary=str(binary))
+            with mock.patch.dict(os.environ, {'SUDO_COMMAND':'/usr/bin/bash --client acme.sh', 'SUDO_UID':'1000'}), \
+                    mock.patch.object(manage.os, 'geteuid', return_value=0), \
+                    mock.patch('pwd.getpwuid', return_value=mock.Mock(pw_dir='/root')):
+                manage.ensure_acme(config)
 
     def test_old_acme_clients_fail_early_for_ip_certificate(self):
         with tempfile.TemporaryDirectory() as root:

@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shlex
 import shutil
@@ -31,6 +32,16 @@ IMAGE = "familychat-keyserver:local"
 def command(args, **kwargs):
     # Never print commands: imported file paths/DNS arguments may be sensitive.
     subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+
+def acme_environment(base=None):
+    env = dict(os.environ if base is None else base)
+    if os.geteuid() == 0:
+        # This controller already runs as root. Inherited sudo arguments such as
+        # '--client acme.sh' otherwise trigger acme.sh's interactive sudo guard.
+        env = {name: value for name, value in env.items() if not name.startswith('SUDO_')}
+        env['HOME'] = pwd.getpwuid(0).pw_dir
+    return env
 
 
 # Official acme.sh 3.1.6 commit archive, verified during release development.
@@ -180,7 +191,7 @@ def ensure_acme(config):
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(archive.extractfile(member).read())
                     target.chmod(0o700)
-        command(['sh', root / prefix / 'acme.sh', '--install', '--home', binary.parent, '--nocron', '--noprofile', '--accountemail', config['email']], cwd=root / prefix)
+        command(['sh', root / prefix / 'acme.sh', '--install', '--home', binary.parent, '--nocron', '--noprofile', '--accountemail', config['email']], cwd=root / prefix, env=acme_environment())
     if not binary.is_file():
         raise RuntimeError('acme.sh не установлен')
     require_ip_support(config)
@@ -202,7 +213,8 @@ def require_ip_support(config):
     else:
         args, flags = [config['acme_binary'], '--help'], ('--certificate-profile', '--days')
         message = 'Для IP-сертификата обновите acme.sh: требуется поддержка --certificate-profile и --days'
-    result = subprocess.run(args, check=True, capture_output=True, text=True)
+    result = subprocess.run(args, check=True, capture_output=True, text=True,
+                            env=acme_environment() if config['client'] == 'acme.sh' else None)
     if not all(flag in result.stdout for flag in flags):
         raise RuntimeError(message)
 
@@ -324,7 +336,8 @@ def certbot_base(config):
 
 
 def acme_base(config):
-    return [config["acme_binary"], "--config-home", str(Path(config["install_dir"]) / "acme/acme.sh")]
+    return [config["acme_binary"], "--config-home", str(Path(config["install_dir"]) / "acme/acme.sh"),
+            "--home", str(Path(config["acme_binary"]).parent)]
 
 
 def dns_args(config):
@@ -399,7 +412,7 @@ def publish_certificate(config):
             finally:
                 Path(temporary).unlink(missing_ok=True)
     else:
-        command(acme_base(config) + ["--install-cert", "--ecc", "-d", config["domain"], "--key-file", tls_dir / "privkey.pem", "--fullchain-file", tls_dir / "fullchain.pem"])
+        command(acme_base(config) + ["--install-cert", "--ecc", "-d", config["domain"], "--key-file", tls_dir / "privkey.pem", "--fullchain-file", tls_dir / "fullchain.pem"], env=acme_environment())
     protect_tree(tls_dir, 10001)
     # The Go service reads valid renewed PEM pairs at each new TLS handshake.
 
@@ -413,6 +426,8 @@ def certificate(config, renew=False):
     env = os.environ.copy()
     if config.get("dns_env"):
         env.update(read_dns_env(config["dns_env"]))
+    if config['client'] == 'acme.sh':
+        env = acme_environment(env)
     if config["challenge"] == "standalone":
         ensure_port_available(80)
     if config["client"] == "certbot":

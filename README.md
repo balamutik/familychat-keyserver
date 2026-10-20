@@ -27,6 +27,8 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-ke
 
 Скрипт задаёт вопросы через `/dev/tty`, поэтому ввод работает и при `curl | sudo bash`. Для запуска без терминала укажите все параметры, а зависимости установите заранее. По умолчанию каталог установки — `/opt/familychat-keyserver`.
 
+При запуске через `sudo` установщик вызывает acme.sh от root с домашним каталогом root и явно указанными каталогами клиента и конфигурации. Переменные `SUDO_*` убираются только из окружения дочернего ACME-процесса: аргумент `--client acme.sh` иначе вызывает ложное срабатывание интерактивной проверки acme.sh. Это применяется также к регистрации, продлению и сохранению сертификата; принудительный перевыпуск `--force` не используется. Настройки DNS-провайдера сохраняются.
+
 **certbot** или **acme.sh** выбирается параметром `--client` либо в диалоге. Если certbot отсутствует, установщик предложит apt-пакет `certbot`. DNS-плагины certbot устанавливаются администратором отдельно. При выборе отсутствующего acme.sh установщик предложит официальный архив версии 3.1.6, закреплённый коммитом и SHA-256, и необходимые `curl`, `openssl`, `socat`. Архив проверяется до исполнения; установка выполняется без собственного cron, продление обслуживает таймер keyserver. Уже установленный клиент используется без переустановки; другой путь acme.sh можно задать через `--acme-binary`.
 
 Релиз содержит готовый публичный образ `ghcr.io/balamutik/familychat-keyserver@sha256:…`; Go, git и сборка приложения на VPS не нужны. Архив `familychat-keyserver.tar.gz` проверяется по `SHA256SUMS`, а его манифест — по репозиторию, версии и неизменяемому образу. Загрузка и распаковка ограничены по размеру; состояние и ключи в релиз не включаются. Начальный `install.sh` и суммы загружаются по HTTPS из одного доверенного GitHub-релиза; контрольная сумма не является отдельной подписью издателя.
@@ -34,7 +36,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-ke
 Чтобы закрепить версию, используйте её URL и первым аргументом ту же версию:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.1/install.sh | sudo bash -s -- v1.0.1
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.2/install.sh | sudo bash -s -- v1.0.2
 ```
 
 ### Новый чат: свободный порт 80
@@ -190,7 +192,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-ke
 Обновление до определённой версии:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.1/install.sh | sudo bash -s -- v1.0.1 update
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/balamutik/familychat-keyserver/releases/download/v1.0.2/install.sh | sudo bash -s -- v1.0.2 update
 ```
 
 Для нестандартного каталога добавьте `--install-dir /opt/your-keyserver`. Скрипт проверяет новый комплект, создаёт закрытую резервную копию, загружает неизменяемый образ и пересоздаёт только службу `keyserver` своего Compose-проекта. Состояние ключей, секрет билетов, TLS, ACME и DNS-настройки сохраняются. Команда `init` при обновлении не вызывается; ротации ключей нет. До обновления дождитесь завершения резервной копии; при ошибке не удаляйте состояние и не запускайте новую установку.
