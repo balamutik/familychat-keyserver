@@ -306,6 +306,10 @@ def prepare_chat(chat_root, ssh_user=None):
         root = _absolute(chat_root)
         _private_directory(root, ROOT_UID, 0)
         _private_directory(STATE_DIR, ROOT_UID, 0, create=True)
+        # Terminal input can wait indefinitely. Never block an existing finish
+        # operation while asking which SSH account will receive its payload.
+        stage = 'выбор SSH-пользователя'
+        username, account, home = _choose_user(ssh_user)
         stage = 'получение блокировки'
         with _lock(STATE_DIR / '.lock'), _lock(root / '.lock'):
             stage = 'проверка релиза'
@@ -315,8 +319,6 @@ def prepare_chat(chat_root, ssh_user=None):
             host = str(ipaddress.ip_address(state['public_ip']))
             stage = 'чтение исходных ключей'
             key = _current_key(root, include_private=True)
-            stage = 'выбор SSH-пользователя'
-            username, account, home = _choose_user(ssh_user)
             stage = 'подготовка каталога обмена'
             transfer = home / TRANSPORT
             _private_directory(transfer, account.pw_uid, account.pw_gid, create=True)
@@ -435,12 +437,17 @@ def _restore(root, nonce, backup):
 
 def _compose(module, root, release, state, restart=True):
     # Docker diagnostics can include settings; only the public result is forwarded.
-    module.compose(root, release, state, 'config', '-q', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     recreate = ('--force-recreate',) if restart else ()
-    module.compose(root, release, state, 'up', '-d', '--no-deps', *recreate, '--wait', '--wait-timeout', '120', 'api',
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    module.compose(root, release, state, 'exec', '-T', 'nginx', 'nginx', '-s', 'reload',
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    steps = (
+        ('проверка конфигурации Compose', ('config', '-q')),
+        ('запуск API чата', ('up', '-d', '--no-deps', *recreate, '--wait', '--wait-timeout', '120', 'api')),
+        ('перезагрузка nginx', ('exec', '-T', 'nginx', 'nginx', '-s', 'reload')),
+    )
+    for name, arguments in steps:
+        try:
+            module.compose(root, release, state, *arguments, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            raise LinkError('Не выполнен этап Docker Compose: ' + name + '.') from None
 
 
 def _active_matches(root, config):
@@ -469,61 +476,94 @@ def _receipt(metadata):
         os.fsync(parent)
 
 
+def _finish_diagnostic(stage, error):
+    if isinstance(error, LinkError):
+        detail = str(error)
+    elif isinstance(error, FileNotFoundError):
+        detail = 'Не найден обязательный файл или каталог: ' + str(error.filename or 'путь не указан')
+    elif isinstance(error, PermissionError):
+        detail = 'Нет доступа к файлу или каталогу: ' + str(error.filename or 'путь не указан')
+    elif isinstance(error, KeyboardInterrupt):
+        detail = 'Подключение прервано пользователем.'
+    else:
+        # Raw exception text can contain malformed JSON or subprocess secrets.
+        detail = 'Ошибка ' + type(error).__name__ + '; содержимое настроек скрыто.'
+    print(f'Ошибка подключения [{stage}]: {detail}', file=sys.stderr)
+
+
 def finish_chat(nonce):
     """Apply an uploaded connection, or restore the previous healthy configuration."""
     metadata = None
     # A retry may overlap a previous finish that is still applying or has committed.
     # Until the lock and trusted journal prove otherwise, the peer must retain keys.
     uncertain = True
+    stage = 'проверка прав запуска'
     try:
         _root_required()
+        stage = 'проверка служебного каталога'
         _private_directory(STATE_DIR, ROOT_UID, 0)
+        stage = 'получение блокировки подключения'
         with _lock(STATE_DIR / '.lock'):
+            stage = 'проверка журнала подключения'
             metadata = _metadata(nonce)
             uncertain = metadata['phase'] not in ('prepared', 'rolled_back')
             root = Path(metadata['chat_root'])
+            stage = 'получение блокировки чата'
             with _lock(root / '.lock'):
+                stage = 'проверка релиза чата'
                 release = _release(root)
                 if json.loads(_read(release / 'release.json')[0]).get('device_key_grants', 0) < 1:
                     raise LinkError('Повторите prepare-chat, чтобы обновить сервер чата до протокола устройств.')
                 module = _controller(release)
+                stage = 'чтение настроек чата'
                 state = module.load_state(root)
+                stage = 'проверка исходного ключа'
                 if _current_key(root)['key_id'] != metadata['key_id']:
                     raise LinkError('Исходный ключ изменился после подготовки.')
                 installed = STATE_DIR / ('connection-' + nonce + '.json')
                 if metadata['phase'] == 'applied':
+                    stage = 'проверка завершённого подключения'
                     data = _read(installed, modes={0o600}, owner=ROOT_UID)[0]
                     if (hashlib.sha256(data).hexdigest() != metadata.get('config_sha256')
                             or not _active_matches(root, _config(data))):
                         raise LinkError('Настройки изменены после подключения.')
+                    stage = 'сохранение подтверждения'
                     _receipt(metadata)
                     _result(nonce, 'applied', metadata['key_id'], metadata['config_sha256'])
                     return 0
                 if metadata['phase'] in ('applying', 'attention'):
                     # An interrupted process may have changed containers. Restore from its
                     # durable journal before considering another upload or safe failure.
+                    stage = 'восстановление прерванного подключения'
                     _restore(root, nonce, metadata['backup'])
                     _compose(module, root, release, state)
                     metadata['phase'] = 'rolled_back'
                     _save_meta(metadata)
                     uncertain = False
+                stage = 'проверка файла подключения'
                 incoming = Path(metadata['transport']) / 'connection.json'
                 data = _read(incoming, modes={0o600}, owner=metadata['uid'])[0]
                 config = _config(data)
                 if config['key_id'] != metadata['key_id']:
                     raise LinkError('Новый сервер использует другой ключ переписки.')
+                stage = 'сохранение файла подключения'
                 _write(installed, data, uid=ROOT_UID)
                 digest = hashlib.sha256(data).hexdigest()
                 if not _active_matches(root, config):
+                    stage = 'сохранение резервной копии'
                     metadata['backup'] = _snapshot(root, nonce)
                     metadata['phase'] = 'applying'
                     metadata['config_sha256'] = digest
                     _save_meta(metadata)
                     uncertain = True
                     try:
+                        stage = 'применение настроек сервера ключей'
                         module.configure_key_service(root, installed)
+                        stage = 'запуск чата с сервером ключей'
                         _compose(module, root, release, state)
-                    except (Exception, KeyboardInterrupt):
+                    except (Exception, KeyboardInterrupt) as error:
+                        _finish_diagnostic(stage, error)
+                        stage = 'восстановление прежних настроек'
                         _restore(root, nonce, metadata['backup'])
                         _compose(module, root, release, state)
                         metadata['phase'] = 'rolled_back'
@@ -533,16 +573,20 @@ def finish_chat(nonce):
                         print('Подключение не выполнено; прежние настройки и работа API восстановлены.', file=sys.stderr)
                         return 41
                 else:
+                    stage = 'проверка уже подключённого чата'
                     _compose(module, root, release, state, restart=False)
+                stage = 'сохранение результата подключения'
                 metadata['phase'] = 'applied'
                 metadata['config_sha256'] = digest
                 _save_meta(metadata)
                 uncertain = True  # A receipt failure must never cause the peer to roll keys back.
+                stage = 'сохранение подтверждения'
                 _receipt(metadata)
                 _result(nonce, 'applied', metadata['key_id'], digest)
                 print('Сервер ключей подключён. Исходные ключи и резервная копия настроек сохранены.')
                 return 0
-    except (Exception, KeyboardInterrupt):
+    except (Exception, KeyboardInterrupt) as error:
+        _finish_diagnostic(stage, error)
         status = 'attention' if uncertain else 'rolled_back'
         _result(nonce, status, metadata['key_id'] if metadata else None)
         print('Не удалось завершить подключение. ' + ('Повторите команду на сервере ключей; требуется проверка сохранённого состояния.'

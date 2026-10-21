@@ -131,6 +131,28 @@ class ChatBridgeTests(unittest.TestCase):
         self.assertNotIn(self.private, self.output.getvalue() + self.errors.getvalue())
         self.assertEqual((self.root / '.env').read_bytes(), self.env)
 
+    def test_ssh_user_prompt_never_holds_chat_or_handoff_lock(self):
+        bridge._private_directory(bridge.STATE_DIR, bridge.ROOT_UID, 0, create=True)
+        chosen = bridge._choose_user('alice')
+        def prompt(user):
+            # A second process must be able to continue an earlier handoff while
+            # this preparation waits for a terminal answer.
+            with bridge._lock(bridge.STATE_DIR / '.lock'), bridge._lock(self.root / '.lock'):
+                pass
+            return chosen
+        with mock.patch.object(bridge, '_choose_user', side_effect=prompt):
+            self.assertEqual(bridge.prepare_chat(self.root, None), 0)
+
+    def test_cancelled_ssh_user_prompt_preserves_existing_journal_and_keys(self):
+        self.prepare()
+        journal = (bridge.STATE_DIR / 'metadata.json').read_bytes()
+        payload = (self.transport / 'payload.json').read_bytes()
+        with mock.patch.object(bridge, '_choose_user', side_effect=KeyboardInterrupt):
+            self.assertEqual(bridge.prepare_chat(self.root, None), 41)
+        self.assertEqual((bridge.STATE_DIR / 'metadata.json').read_bytes(), journal)
+        self.assertEqual((self.transport / 'payload.json').read_bytes(), payload)
+        self.assertEqual((self.root / '.env').read_bytes(), self.env)
+
     def test_prepare_upgrades_legacy_main_before_exporting_keys(self):
         manifest = self.release / 'release.json'
         manifest.write_text('{"external_key_service":1}')
@@ -464,6 +486,43 @@ print('SELECTED=' + bridge._choose_user(None)[0], flush=True)
             self.assertEqual(bridge.finish_chat(nonce), 42)
         self.assertEqual(self.result()['status'], 'attention')
         self.assertEqual(self.calls, [])
+
+    def test_finish_reports_journal_validation_failure_without_mutating_keys(self):
+        nonce = self.prepare()
+        with mock.patch.object(bridge, '_metadata', side_effect=bridge.LinkError('SSH-пользователь изменён после подготовки.')), self.mock_docker():
+            self.assertEqual(bridge.finish_chat(nonce), 42)
+        self.assertIn('проверка журнала подключения', self.errors.getvalue())
+        self.assertIn('SSH-пользователь изменён после подготовки.', self.errors.getvalue())
+        self.assertEqual(self.calls, [])
+        self.assertEqual((self.root / '.env').read_bytes(), self.env)
+
+    def test_finish_reports_missing_journal_path_without_private_material(self):
+        nonce = self.prepare()
+        path = bridge.STATE_DIR / 'metadata.json'
+        path.unlink()
+        with self.mock_docker():
+            self.assertEqual(bridge.finish_chat(nonce), 42)
+        self.assertIn('проверка журнала подключения', self.errors.getvalue())
+        self.assertIn(str(path), self.errors.getvalue())
+        self.assertNotIn(self.private, self.errors.getvalue())
+        self.assertEqual(self.calls, [])
+
+    def test_finish_never_echoes_arbitrary_exception_details(self):
+        nonce = self.prepare()
+        with mock.patch.object(bridge, '_metadata', side_effect=ValueError(self.private)):
+            self.assertEqual(bridge.finish_chat(nonce), 42)
+        self.assertIn('ValueError', self.errors.getvalue())
+        self.assertNotIn(self.private, self.errors.getvalue())
+
+    def test_failed_apply_reports_compose_step_without_leaking_command_output(self):
+        nonce = self.prepare()
+        self.connection()
+        self.failures = [lambda call: 'up' in call]
+        with self.mock_docker():
+            self.assertEqual(bridge.finish_chat(nonce), 41)
+        self.assertIn('запуск API чата', self.errors.getvalue())
+        self.assertNotIn('ticket secret leaked upstream', self.errors.getvalue())
+        self.assertNotIn(self.private, self.errors.getvalue())
 
 
 if __name__ == '__main__':
